@@ -1,14 +1,12 @@
-import numpy as np
-import pandas as pd
-from data_manager import DataManager
-from saver import Saver
-from constants import code_units
+from octavian.data_manager import DataManager
+from octavian.saver import Saver
+from octavian.constants import code_units
 from os import PathLike
 from time import perf_counter
 
-from utils import wrap_positions
-from fof6d import run_fof6d
-from group_funcs import calculate_group_properties
+from octavian.utils import wrap_positions
+from octavian.fof6d import run_fof6d
+from octavian.group_funcs import calculate_group_properties
 
 class OCTAVIAN:
   def __init__(self, dataset: PathLike, units: dict = {}, nproc: int = 1, *args, **kwargs):

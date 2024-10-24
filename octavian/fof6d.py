@@ -3,13 +3,13 @@ import numpy as np
 import pandas as pd
 import unyt
 from sklearn.neighbors import NearestNeighbors
-import constants as c
+import octavian.constants as c
 from functools import partial
 from multiprocessing import Pool
 
 from typing import Optional, TYPE_CHECKING
 if TYPE_CHECKING:
-  from data_manager import DataManager
+  from octavian.data_manager import DataManager
 
 # get mis for fof6d
 def get_mean_interparticle_separation(data_manager: DataManager) -> None:

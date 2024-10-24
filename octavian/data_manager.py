@@ -1,13 +1,10 @@
 import numpy as np
 import pandas as pd
 import h5py
-from time import perf_counter
-import os
 import unyt
 from astropy.cosmology import FlatLambdaCDM
-import unyt.unit_registry
 from sympy import sympify
-import constants as c
+import octavian.constants as c
 
 class DataManager:
   def __init__(self, snapfile: str, fraction: list[float] = [0, 1]):

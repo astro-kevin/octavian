@@ -3,13 +3,13 @@ import numpy as np
 import pandas as pd
 import unyt
 from sklearn.neighbors import NearestNeighbors
-import constants as c
+import octavian.constants as c
 from functools import partial
 from astropy import constants as const
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-  from data_manager import DataManager
+  from octavian.data_manager import DataManager
 
 
 # helper function to broadcast group properties to particle data, based on haloid

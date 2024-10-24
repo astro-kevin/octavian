@@ -4,7 +4,7 @@ import pandas as pd
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-  from data_manager import DataManager
+  from octavian.data_manager import DataManager
 
 
 # handle periodic boundary for fof and CoM calculations, reset out of bounds positions during save

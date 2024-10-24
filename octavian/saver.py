@@ -1,15 +1,11 @@
 from __future__ import annotations
-import numpy as np
-import pandas as pd
-import pygadgetreader as pygr
 import h5py
-from time import perf_counter
 import os
 import warnings
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-  from data_manager import DataManager
+  from octavian.data_manager import DataManager
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 

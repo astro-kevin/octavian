@@ -4,8 +4,7 @@ import pandas as pd
 import unyt
 from sklearn.neighbors import NearestNeighbors
 import octavian.constants as c
-from functools import partial
-from multiprocessing import Pool
+from joblib import Parallel, delayed
 
 from typing import Optional, TYPE_CHECKING
 if TYPE_CHECKING:
@@ -80,7 +79,7 @@ def kernel(r_over_h,kerneltab):
     return kerneltab[itab]
 
 
-# initialise with partial based on snapshot constants and kernel table
+# fof6d function to apply on groups
 def run_fof6d_in_halo(halo: pd.DataFrame, kernel_table: np.ndarray, minstars: int, fof_LL: float, vel_LL: Optional[float] = None) -> list[list[tuple[int, pd.Index]]]:
   if len(halo) < minstars:
     return []
@@ -116,6 +115,10 @@ def run_fof6d_in_halo(halo: pd.DataFrame, kernel_table: np.ndarray, minstars: in
     # this is a graph with defined directional connections from each node (including to self)
     # galaxies = groups formed by disjoint subsets of all points, with at least a one-directional path
     valid_neighbor_index_lists = [set(index_list_i[dvs_i <= (vel_LL*sigma)]) for index_list_i, dvs_i, sigma in zip(index_lists, dvs, sigmas)]
+
+    valid_neighbor_index_lists = [each for each in valid_neighbor_index_lists if len(each) > 1]
+    if len(valid_neighbor_index_lists) == 0: continue
+
     group_galaxies_indexes = [valid_neighbor_index_lists[0]]
     while len(valid_neighbor_index_lists) != 0:
       current_indexes = valid_neighbor_index_lists.pop(0)
@@ -176,16 +179,9 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
 
   fof_halos['GalID'] = 0
   kernel_table = create_kernel_table(fof_LL)
-  process_halo = partial(run_fof6d_in_halo, kernel_table=kernel_table, minstars=c.MINIMUM_STARS_PER_GALAXY, fof_LL=fof_LL, vel_LL=vel_LL)
   grouped = fof_halos.groupby(by='HaloID')
 
-  if nproc > 1:
-    chunksize = min(grouped.ngroups // nproc, 50)
-    with Pool(processes=nproc) as p:
-      galaxies = p.map(process_halo, [group for i, group in grouped], chunksize=chunksize)
-  else:
-    galaxies = grouped.apply(process_halo, include_groups = False)
-
+  galaxies = Parallel(n_jobs=nproc)(delayed(run_fof6d_in_halo)(halo, kernel_table, c.MINIMUM_STARS_PER_GALAXY, fof_LL, vel_LL) for idx, halo in grouped)
   galaxies = [galaxy for galaxy_list in galaxies for galaxy in galaxy_list if len(galaxy_list) != 0]
 
   for ptype in ['gas', 'dm', 'star', 'bh']:
@@ -196,5 +192,3 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
       data_manager[c.ptype_names[ptype_id]].loc[ptype_indexes, 'GalID'] = i
 
   data_manager.galaxies = pd.DataFrame(index=np.arange(len(galaxies)))
-
-

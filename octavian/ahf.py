@@ -86,22 +86,20 @@ def _union_arrays(a: np.ndarray, b: np.ndarray) -> np.ndarray:
   return np.union1d(a, b)
 
 
-def _prepare_index_lookup(index_array: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _prepare_index_lookup(index_array: np.ndarray) -> np.ndarray:
   if index_array.size == 0:
-    return _empty_array(), _empty_array()
-  sorter = np.argsort(index_array)
-  return index_array[sorter], sorter
+    return _empty_array()
+  return np.sort(index_array)
 
 
-def _map_pid_array(pid_array: np.ndarray, lookup: Tuple[np.ndarray, np.ndarray]) -> Tuple[np.ndarray, int]:
+def _map_pid_array(pid_array: np.ndarray, values: np.ndarray) -> Tuple[np.ndarray, int]:
   if pid_array.size == 0:
     return _empty_array(), 0
-  values, sorter = lookup
   if values.size == 0:
     return _empty_array(), pid_array.size
   positions = np.searchsorted(values, pid_array)
   valid_mask = (positions < values.size) & (values[positions] == pid_array)
-  matched = sorter[positions[valid_mask]] if valid_mask.any() else _empty_array()
+  matched = values[positions[valid_mask]] if valid_mask.any() else _empty_array()
   missing = pid_array.size - matched.size
   return matched, missing
 

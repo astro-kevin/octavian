@@ -4,24 +4,36 @@ import h5py
 import unyt
 from astropy.cosmology import FlatLambdaCDM
 from sympy import sympify
+from typing import Optional, Sequence
+
 import octavian.constants as c
 
+
 class DataManager:
-  def __init__(self, snapfile: str, fraction: list[float] = [0, 1]):
+  def __init__(self, snapfile: str, fraction: Sequence[float] = (0, 1), mode: str = 'fof', include_unassigned: Optional[bool] = None):
     self.snapfile = snapfile
+    self.mode = mode.lower()
     self.start_fraction = fraction[0]
     self.end_fraction = fraction[1]
 
     self.load_simulation_constants()
 
-    self.initialise_dataframes_with_haloids()
-    self.validate_halos()
+    keep_unassigned = include_unassigned if include_unassigned is not None else (self.mode == 'ahf-fast')
+    self.initialise_dataframes_with_haloids(remove_unassigned=not keep_unassigned)
+    self.ensure_membership_columns()
+
+    if self.mode in ('fof', 'ahf'):
+      self.validate_halos()
+    else:
+      self.haloIDs = np.array([], dtype=int)
 
     self.load_masses()
 
-    # initialise group dfs, halos with pids
-    self.halos = pd.DataFrame(index=self.haloIDs)
-    self.load_halo_pids()
+    if self.mode in ('fof', 'ahf'):
+      self.halos = pd.DataFrame(index=self.haloIDs)
+      self.load_halo_pids()
+    else:
+      self.halos = pd.DataFrame()
 
   # programmatic access to attrs based on https://peps.python.org/pep-0363/
   def __getitem__(self, name):
@@ -73,17 +85,30 @@ class DataManager:
   def create_unit_quantity(self, prop: str) -> unyt.unyt_quantity:
     return unyt.unyt_quantity(1., c.code_units[prop], registry=self.units.registry)
 
-  def initialise_dataframes_with_haloids(self) -> None:
+  def initialise_dataframes_with_haloids(self, remove_unassigned: bool = True) -> None:
     with h5py.File(self.snapfile) as f:
       for ptype, name in c.ptypes.items():
-        self[ptype] = pd.DataFrame()
-        self[ptype]['HaloID'] = f[name]['HaloID'][:]
+        frame = pd.DataFrame()
+        haloids = f[name]['HaloID'][:]
+        if remove_unassigned:
+          selection = haloids != 0
+          frame['HaloID'] = haloids[selection]
+          frame.index = np.arange(len(haloids))[selection]
+        else:
+          frame['HaloID'] = haloids
+          frame.index = np.arange(len(haloids))
 
-        self[ptype] = self[ptype].loc[self[ptype]['HaloID'] != 0]
-        self[ptype]['ptype'] = c.ptype_ids[ptype]
+        frame['ptype'] = c.ptype_ids[ptype]
+        frame.sort_values(by='HaloID', inplace=True)
+        frame.rename_axis(index='pid', inplace=True)
+        setattr(self, ptype, frame)
 
-        self[ptype].sort_values(by='HaloID', inplace=True)
-        self[ptype].rename_axis(index='pid', inplace=True)
+  def ensure_membership_columns(self) -> None:
+    for ptype in c.ptypes.keys():
+      if 'GalID' not in self[ptype]:
+        self[ptype]['GalID'] = -1
+      else:
+        self[ptype]['GalID'] = self[ptype]['GalID'].astype(int)
 
   def validate_halos(self) -> None:
     halos_combined = pd.concat([self[ptype][['HaloID']] for ptype in c.ptypes.keys()]).groupby(by='HaloID').filter(lambda halo: len(halo) >= c.MINIMUM_DM_PER_HALO).sort_values(by='HaloID')
@@ -103,27 +128,30 @@ class DataManager:
 
   def load_halo_pids(self) -> None:
     for ptype in c.ptypes.keys():
-      ptype_plists = self[ptype].groupby(by='HaloID').apply(lambda x: x.index.to_numpy())
-      plist = c.ptype_lists[ptype]
+      frame = self[ptype]
+      if 'HaloID' not in frame or len(frame) == 0:
+        plist = pd.Series(dtype=object)
+      else:
+        plist = frame.groupby(by='HaloID').apply(lambda x: x.index.to_numpy())
+      self.halos[c.ptype_lists[ptype]] = plist
 
-      self.halos[plist] = ptype_plists
-
-    # cursed replacement of nans with empty lists, based on https://stackoverflow.com/a/62689667
     for plist in c.ptype_lists.values():
-      self.halos[plist] = self.halos[plist].fillna({i: [] for i in self.halos.index})
+      self.halos[plist] = self.halos.get(plist, pd.Series(dtype=object)).fillna({i: [] for i in self.halos.index})
 
   def load_galaxy_pids(self) -> None:
     for ptype in c.ptypes.keys():
       if ptype == 'dm': continue
 
       data = self[ptype].loc[self[ptype]['GalID'] != -1].copy()
-      ptype_plists = data.groupby(by='GalID').apply(lambda x: x.index.to_numpy())
-      plist = c.ptype_lists[ptype]
-
-      self.galaxies[plist] = ptype_plists
+      if len(data) == 0:
+        plist = pd.Series(dtype=object)
+      else:
+        plist = data.groupby(by='GalID').apply(lambda x: x.index.to_numpy())
+      self.galaxies[c.ptype_lists[ptype]] = plist
 
     for plist in c.ptype_lists.values():
-      self.galaxies[plist] = self.galaxies[plist].fillna({i: [] for i in self.galaxies.index})
+      if plist in self.galaxies:
+        self.galaxies[plist] = self.galaxies[plist].fillna({i: [] for i in self.galaxies.index})
 
   def load_masses(self):
     with h5py.File(self.snapfile) as f:
@@ -134,6 +162,17 @@ class DataManager:
         
         self[f'n{ptype}'] = len(masses)
         self[f'm{ptype}_total'] = np.sum(masses)
+
+  def ensure_property(self, prop: str, ptype: str) -> None:
+    column = self.get_column_name(prop)
+    frame = self[ptype]
+    if isinstance(column, list):
+      if all(col in frame for col in column):
+        return
+    else:
+      if column in frame:
+        return
+    self.load_property(prop, ptype)
 
   def get_prop_name(self, prop: str) -> str:
     return c.prop_aliases[prop.strip(' _').lower()]
@@ -162,10 +201,18 @@ class DataManager:
     column = self.get_column_name(requested_prop)
 
     with h5py.File(self.snapfile) as f:
-      if requested_prop == 'metallicity':
-        self[requested_ptype][column] = f[ptype][prop][:, 0][self[requested_ptype].index]
-      elif requested_prop == 'age':
-        data = f[ptype][prop][:][self[requested_ptype].index]
-        self[requested_ptype][column] = self.simulation['time_gyr'] - self.cosmology.age(1/data - 1).value
+      data = f[ptype][prop][:]
+      indexer = self[requested_ptype].index
+      if isinstance(column, list):
+        values = data[indexer]
+        for idx, col in enumerate(column):
+          self[requested_ptype][col] = values[:, idx] * self.get_unit_conversion_factor(requested_prop)
       else:
-        self[requested_ptype][column] = f[ptype][prop][:][self[requested_ptype].index] * self.get_unit_conversion_factor(requested_prop)
+        if requested_prop == 'metallicity':
+          self[requested_ptype][column] = data[:, 0][indexer]
+        elif requested_prop == 'age':
+          selection = data[indexer]
+          self[requested_ptype][column] = self.simulation['time_gyr'] - self.cosmology.age(1/selection - 1).value
+        else:
+          factor = self.get_unit_conversion_factor(requested_prop)
+          self[requested_ptype][column] = data[indexer] * factor

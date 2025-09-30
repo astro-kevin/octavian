@@ -50,6 +50,7 @@ prop_aliases = {
   'fh2':'FractionH2',
   'bhmass': 'BH_Mass',
   'bhmdot': 'BH_Mdot',
+  'pid': 'ParticleIDs',
 }
 
 prop_units = {

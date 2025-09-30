@@ -440,6 +440,29 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
   if not matches:
     raise ValueError('Unable to match any galaxies to AHF halos.')
 
+  num_original_galaxies = len(data_manager.galaxies)
+  original_particle_labels = {
+    ptype: data_manager[ptype]['GalID'].to_numpy(copy=True)
+    for ptype in c.ptypes.keys()
+  }
+  particle_indices = {
+    ptype: data_manager[ptype].index.to_numpy(dtype=np.int64)
+    for ptype in c.ptypes.keys()
+  }
+
+  galaxy_to_halo = np.full(num_original_galaxies, -1, dtype=np.int64)
+  for gid, hid in matches.items():
+    if hid is None or hid < 0:
+      continue
+    if 0 <= gid < num_original_galaxies:
+      galaxy_to_halo[gid] = int(hid)
+
+  from collections import defaultdict
+  halo_to_galaxy_indices: Dict[int, List[int]] = defaultdict(list)
+  for gid, hid in enumerate(galaxy_to_halo.tolist()):
+    if hid >= 0:
+      halo_to_galaxy_indices[int(hid)].append(gid)
+
   selected_halos = sorted({hid for hid in matches.values() if hid is not None and hid >= 0})
   if not selected_halos:
     raise ValueError('No valid AHF halos matched to FoF galaxies.')
@@ -452,9 +475,6 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
     manager[ptype]['GalID'] = -1
 
   halo_to_gid = {hid: idx for idx, hid in enumerate(selected_halos)}
-  manager.galaxies = pd.DataFrame(index=np.arange(len(selected_halos)))
-  manager.galaxies['AHF_halo_id'] = selected_halos
-  manager.galaxies['AHF_host_id'] = [top_host(hid, catalog.parent_of) for hid in selected_halos]
 
   missing_counts = {'gas': 0, 'star': 0, 'bh': 0, 'dm': 0}
 
@@ -502,6 +522,38 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
       manager['bh'].loc[update_map['bh'], 'GalID'] = gid
     if update_map['dm'].size:
       manager['dm'].loc[update_map['dm'], 'GalID'] = gid
+
+  matched_count = len(selected_halos)
+  galaxy_new_ids = np.full(num_original_galaxies, -1, dtype=int)
+  for hid, gid in halo_to_gid.items():
+    for original_gid in halo_to_galaxy_indices.get(hid, []):
+      if 0 <= original_gid < num_original_galaxies:
+        galaxy_new_ids[original_gid] = gid
+
+  unmatched_galaxies = [gi for gi in range(num_original_galaxies) if galaxy_new_ids[gi] == -1]
+  next_gid = matched_count
+  for original_gid in unmatched_galaxies:
+    new_gid = next_gid
+    next_gid += 1
+    galaxy_new_ids[original_gid] = new_gid
+    for ptype in c.ptypes.keys():
+      labels = original_particle_labels.get(ptype)
+      if labels is None or labels.size == 0:
+        continue
+      mask = labels == original_gid
+      if not np.any(mask):
+        continue
+      indexes = particle_indices[ptype][mask]
+      manager[ptype].loc[indexes, 'GalID'] = new_gid
+
+  total_galaxies = next_gid
+  data_manager_galaxies = pd.DataFrame(index=np.arange(total_galaxies))
+  data_manager_galaxies['AHF_halo_id'] = -1
+  data_manager_galaxies['AHF_host_id'] = -1
+  for hid, gid in halo_to_gid.items():
+    data_manager_galaxies.loc[gid, 'AHF_halo_id'] = hid
+    data_manager_galaxies.loc[gid, 'AHF_host_id'] = top_host(hid, catalog.parent_of)
+  manager.galaxies = data_manager_galaxies
 
   manager.load_galaxy_pids()
   return halo_to_gid, missing_counts

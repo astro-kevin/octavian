@@ -98,8 +98,14 @@ def _map_pid_array(pid_array: np.ndarray, values: np.ndarray) -> Tuple[np.ndarra
   if values.size == 0:
     return _empty_array(), pid_array.size
   positions = np.searchsorted(values, pid_array)
-  valid_mask = (positions < values.size) & (values[positions] == pid_array)
-  matched = values[positions[valid_mask]] if valid_mask.any() else _empty_array()
+  within = positions < values.size
+  matches = np.zeros(pid_array.size, dtype=bool)
+  if within.any():
+    pos_within = positions[within]
+    pid_within = pid_array[within]
+    matches_within = values[pos_within] == pid_within
+    matches[within] = matches_within
+  matched = values[positions[matches]] if matches.any() else _empty_array()
   missing = pid_array.size - matched.size
   return matched, missing
 

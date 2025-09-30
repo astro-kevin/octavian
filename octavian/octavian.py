@@ -28,29 +28,49 @@ class OCTAVIAN:
     if self.mode in {'ahf', 'ahf-fast'} and self.ahf_particles is None:
       raise ValueError('AHF modes require the path to an AHF_particles catalogue.')
 
-  def member_search(self, file: PathLike, *args, **kwargs):
-    print('Initialising Data Manager...')
+  def _log_step(self, current: int, total: int, message: str) -> None:
+    print(f"[{current}/{total}] {message}", flush=True)
+
+  def _log_duration(self, start_time: float) -> None:
+    print(f"    Done in {perf_counter() - start_time:.2f} seconds.", flush=True)
+
+  def run(self, file: PathLike, *args, **kwargs):
+    if self.mode == 'fof':
+      total_steps = 5
+    elif self.mode == 'ahf':
+      total_steps = 7
+    else:
+      total_steps = 6
+
+    step = 1
+    self._log_step(step, total_steps, 'Initialising data manager...')
     t1 = perf_counter()
     data_manager = DataManager(self.dataset, mode=self.mode)
-    t2 = perf_counter()
-    print(f'Done in {t2-t1:.2f} seconds.')
+    self._log_duration(t1)
+    step += 1
+
+    catalog = None
+    if self.mode in {'ahf', 'ahf-fast'}:
+      self._log_step(step, total_steps, 'Loading AHF catalogue...')
+      t1 = perf_counter()
+      catalog = load_catalog(str(self.ahf_particles), str(self.ahf_halos) if self.ahf_halos else None)
+      self._log_duration(t1)
+      step += 1
 
     if self.mode == 'fof':
-      self._run_fof(data_manager)
+      step = self._run_fof(data_manager, step, total_steps)
     elif self.mode == 'ahf':
-      catalog = load_catalog(str(self.ahf_particles), str(self.ahf_halos) if self.ahf_halos else None)
-      self._run_ahf(data_manager, catalog)
-    else:  # AHF-FAST
-      catalog = load_catalog(str(self.ahf_particles), str(self.ahf_halos) if self.ahf_halos else None)
-      self._run_ahf_fast(data_manager, catalog)
+      step = self._run_ahf(data_manager, catalog, step, total_steps, self.nproc)
+    else:
+      step = self._run_ahf_fast(data_manager, catalog, step, total_steps, self.nproc)
 
-    print('Calculating group properties...')
+    self._log_step(step, total_steps, 'Calculating group properties...')
     t1 = perf_counter()
     calculate_group_properties(data_manager)
-    t2 = perf_counter()
-    print(f'Done in {t2-t1:.2f} seconds.')
+    self._log_duration(t1)
+    step += 1
 
-    print('Saving datasets...')
+    self._log_step(step, total_steps, 'Saving datasets...')
     t1 = perf_counter()
     if 'halos' in data_manager:
       data_manager['halos'].fillna(0., inplace=True)
@@ -58,51 +78,59 @@ class OCTAVIAN:
       data_manager['galaxies'].fillna(0., inplace=True)
     saver = Saver(file)
     saver.save_data(data_manager)
-    t2 = perf_counter()
-    print(f'Done in {t2-t1:.2f} seconds.')
+    self._log_duration(t1)
 
-  def _run_fof(self, data_manager: DataManager) -> None:
-    print('Wrapping positions...')
+  def member_search(self, file: PathLike, *args, **kwargs):
+    print('member_search() is deprecated; use run() instead.', flush=True)
+    self.run(file, *args, **kwargs)
+
+  def _run_fof(self, data_manager: DataManager, step: int, total_steps: int) -> int:
+    self._log_step(step, total_steps, 'Wrapping positions...')
     t1 = perf_counter()
     wrap_positions(data_manager)
-    t2 = perf_counter()
-    print(f'Done in {t2-t1:.2f} seconds.')
+    self._log_duration(t1)
+    step += 1
 
-    print('Running FOF6D...')
+    self._log_step(step, total_steps, 'Running FOF6D...')
     t1 = perf_counter()
     run_fof6d(data_manager, nproc=self.nproc)
-    t2 = perf_counter()
-    print(f'Done in {t2-t1:.2f} seconds.')
+    self._log_duration(t1)
+    step += 1
+    return step
 
-  def _run_ahf(self, data_manager: DataManager, catalog) -> None:
-    print('Wrapping positions...')
+  def _run_ahf(self, data_manager: DataManager, catalog, step: int, total_steps: int, n_jobs: int) -> int:
+    self._log_step(step, total_steps, 'Wrapping positions...')
     t1 = perf_counter()
     wrap_positions(data_manager)
-    t2 = perf_counter()
-    print(f'Done in {t2-t1:.2f} seconds.')
+    self._log_duration(t1)
+    step += 1
 
-    print('Running FOF6D...')
+    self._log_step(step, total_steps, 'Running FOF6D...')
     t1 = perf_counter()
     run_fof6d(data_manager, nproc=self.nproc)
-    t2 = perf_counter()
-    print(f'Done in {t2-t1:.2f} seconds.')
+    self._log_duration(t1)
+    step += 1
 
-    print('Matching FoF galaxies to AHF halos...')
+    self._log_step(step, total_steps, 'Matching FoF galaxies to AHF halos...')
     t1 = perf_counter()
-    halo_map, missing = apply_ahf_matching(data_manager, catalog)
-    t2 = perf_counter()
+    halo_map, missing = apply_ahf_matching(data_manager, catalog, n_jobs=n_jobs)
+    self._log_duration(t1)
     matched = len(halo_map)
-    print(f'Matched {matched} AHF halos in {t2-t1:.2f} seconds (missing particles: {missing}).')
+    print(f"    Matched {matched} AHF halos (missing particles: {missing}).", flush=True)
+    step += 1
+    return step
 
-  def _run_ahf_fast(self, data_manager: DataManager, catalog) -> None:
-    print('Building halos/galaxies from AHF-FAST catalogue...')
+  def _run_ahf_fast(self, data_manager: DataManager, catalog, step: int, total_steps: int, n_jobs: int) -> int:
+    self._log_step(step, total_steps, 'Building halos/galaxies from AHF-FAST catalogue...')
     t1 = perf_counter()
-    missing = build_galaxies_from_fast(data_manager, catalog)
-    t2 = perf_counter()
-    print(f'Assigned AHF-FAST payloads in {t2-t1:.2f} seconds (missing particles: {missing}).')
+    missing = build_galaxies_from_fast(data_manager, catalog, n_jobs=n_jobs)
+    self._log_duration(t1)
+    print(f"    Assigned particles with missing counts: {missing}", flush=True)
+    step += 1
 
-    print('Wrapping positions...')
+    self._log_step(step, total_steps, 'Wrapping positions...')
     t1 = perf_counter()
     wrap_positions(data_manager)
-    t2 = perf_counter()
-    print(f'Done in {t2-t1:.2f} seconds.')
+    self._log_duration(t1)
+    step += 1
+    return step

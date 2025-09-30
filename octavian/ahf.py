@@ -441,15 +441,6 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
     raise ValueError('Unable to match any galaxies to AHF halos.')
 
   num_original_galaxies = len(data_manager.galaxies)
-  original_particle_labels = {
-    ptype: data_manager[ptype]['GalID'].to_numpy(copy=True)
-    for ptype in c.ptypes.keys()
-  }
-  particle_indices = {
-    ptype: data_manager[ptype].index.to_numpy(dtype=np.int64)
-    for ptype in c.ptypes.keys()
-  }
-
   galaxy_to_halo = np.full(num_original_galaxies, -1, dtype=np.int64)
   for gid, hid in matches.items():
     if hid is None or hid < 0:
@@ -462,101 +453,31 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
   for gid, hid in enumerate(galaxy_to_halo.tolist()):
     if hid >= 0:
       halo_to_galaxy_indices[int(hid)].append(gid)
+  unique_halos = sorted({hid for hid in matches.values() if hid is not None and hid >= 0})
 
-  selected_halos = sorted({hid for hid in matches.values() if hid is not None and hid >= 0})
-  if not selected_halos:
-    raise ValueError('No valid AHF halos matched to FoF galaxies.')
+  if 'AHF_halo_id' not in manager.galaxies:
+    manager.galaxies['AHF_halo_id'] = -1
+  if 'AHF_host_id' not in manager.galaxies:
+    manager.galaxies['AHF_host_id'] = -1
+  if 'AHF_matched' not in manager.galaxies:
+    manager.galaxies['AHF_matched'] = False
 
-  exclusives = catalog.compute_exclusive_baryons(selected_halos, n_jobs=n_jobs)
-  dm_sets = catalog.gather_dm_sets(selected_halos)
+  ahf_halo_ids = np.full(num_original_galaxies, -1, dtype=np.int64)
+  ahf_host_ids = np.full(num_original_galaxies, -1, dtype=np.int64)
 
-  index_lookup = {ptype: _prepare_index_lookup(manager[ptype].index.to_numpy(dtype=np.int64)) for ptype in c.ptypes.keys()}
-  for ptype in c.ptypes.keys():
-    manager[ptype]['GalID'] = -1
+  for gid, hid in enumerate(galaxy_to_halo.tolist()):
+    if hid < 0:
+      continue
+    ahf_halo_ids[gid] = hid
+    ahf_host_ids[gid] = top_host(hid, catalog.parent_of)
 
-  halo_to_gid = {hid: idx for idx, hid in enumerate(selected_halos)}
+  manager.galaxies.loc[:, 'AHF_halo_id'] = ahf_halo_ids[:len(manager.galaxies)]
+  manager.galaxies.loc[:, 'AHF_host_id'] = ahf_host_ids[:len(manager.galaxies)]
+  manager.galaxies.loc[:, 'AHF_matched'] = manager.galaxies['AHF_halo_id'] >= 0
 
   missing_counts = {'gas': 0, 'star': 0, 'bh': 0, 'dm': 0}
-
-  def prepare_assignment(hid: int):
-    gid = halo_to_gid[hid]
-    baryons = exclusives.get(hid, {})
-    update_map: Dict[str, np.ndarray] = {
-      'gas': _empty_array(),
-      'star': _empty_array(),
-      'bh': _empty_array(),
-      'dm': _empty_array()
-    }
-    local_missing = {'gas': 0, 'star': 0, 'bh': 0, 'dm': 0}
-
-    for ptype in ('gas', 'star', 'bh'):
-      pid_array = baryons.get(ptype, _empty_array())
-      if pid_array.size == 0:
-        continue
-      valid, missing = _map_pid_array(pid_array, index_lookup[ptype])
-      local_missing[ptype] += missing
-      update_map[ptype] = valid
-
-    dm_array = dm_sets.get(hid, _empty_array())
-    if dm_array.size:
-      valid_dm, missing_dm = _map_pid_array(dm_array, index_lookup['dm'])
-      local_missing['dm'] += missing_dm
-      update_map['dm'] = valid_dm
-
-    return gid, update_map, local_missing
-
-  if n_jobs == 1 or len(selected_halos) <= 1:
-    assignments = [prepare_assignment(hid) for hid in tqdm(selected_halos, total=len(selected_halos), desc='Assigning galaxies to halos', unit='halo', leave=False)]
-  else:
-    with tqdm_joblib(tqdm(total=len(selected_halos), desc='Assigning galaxies to halos', unit='halo', leave=False)):
-      assignments = Parallel(n_jobs=n_jobs, backend='threading')(delayed(prepare_assignment)(hid) for hid in selected_halos)
-
-  for gid, update_map, local_missing in assignments:
-    for key, value in local_missing.items():
-      missing_counts[key] += value
-    if update_map['gas'].size:
-      manager['gas'].loc[update_map['gas'], 'GalID'] = gid
-    if update_map['star'].size:
-      manager['star'].loc[update_map['star'], 'GalID'] = gid
-    if update_map['bh'].size:
-      manager['bh'].loc[update_map['bh'], 'GalID'] = gid
-    if update_map['dm'].size:
-      manager['dm'].loc[update_map['dm'], 'GalID'] = gid
-
-  matched_count = len(selected_halos)
-  galaxy_new_ids = np.full(num_original_galaxies, -1, dtype=int)
-  for hid, gid in halo_to_gid.items():
-    for original_gid in halo_to_galaxy_indices.get(hid, []):
-      if 0 <= original_gid < num_original_galaxies:
-        galaxy_new_ids[original_gid] = gid
-
-  unmatched_galaxies = [gi for gi in range(num_original_galaxies) if galaxy_new_ids[gi] == -1]
-  next_gid = matched_count
-  for original_gid in unmatched_galaxies:
-    new_gid = next_gid
-    next_gid += 1
-    galaxy_new_ids[original_gid] = new_gid
-    for ptype in c.ptypes.keys():
-      labels = original_particle_labels.get(ptype)
-      if labels is None or labels.size == 0:
-        continue
-      mask = labels == original_gid
-      if not np.any(mask):
-        continue
-      indexes = particle_indices[ptype][mask]
-      manager[ptype].loc[indexes, 'GalID'] = new_gid
-
-  total_galaxies = next_gid
-  data_manager_galaxies = pd.DataFrame(index=np.arange(total_galaxies))
-  data_manager_galaxies['AHF_halo_id'] = -1
-  data_manager_galaxies['AHF_host_id'] = -1
-  for hid, gid in halo_to_gid.items():
-    data_manager_galaxies.loc[gid, 'AHF_halo_id'] = hid
-    data_manager_galaxies.loc[gid, 'AHF_host_id'] = top_host(hid, catalog.parent_of)
-  manager.galaxies = data_manager_galaxies
-
-  manager.load_galaxy_pids()
-  return halo_to_gid, missing_counts
+  halo_map = {hid: len(halo_to_galaxy_indices.get(hid, [])) for hid in unique_halos}
+  return halo_map, missing_counts
 
 
 def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_stars: int = c.MINIMUM_STARS_PER_GALAXY, n_jobs: int = 1) -> Dict[str, int]:

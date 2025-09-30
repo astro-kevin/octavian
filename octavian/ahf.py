@@ -436,24 +436,42 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
   if not galaxy_star_sets:
     raise ValueError('No FoF galaxies available to match against AHF halos.')
 
-  matches = catalog.match_galaxies_to_halos(galaxy_star_sets, n_jobs=n_jobs)
-  if not matches:
-    raise ValueError('Unable to match any galaxies to AHF halos.')
+  from collections import defaultdict, Counter
+
+  exclusives = catalog.compute_exclusive_baryons(set(catalog.particles.keys()), n_jobs=n_jobs)
+  exclusive_star_map: Dict[int, int] = {}
+  for hid, data in exclusives.items():
+    stars = data.get('star')
+    if stars is None or stars.size == 0:
+      continue
+    for pid in stars:
+      exclusive_star_map[int(pid)] = int(hid)
 
   num_original_galaxies = len(data_manager.galaxies)
   galaxy_to_halo = np.full(num_original_galaxies, -1, dtype=np.int64)
-  for gid, hid in matches.items():
-    if hid is None or hid < 0:
-      continue
-    if 0 <= gid < num_original_galaxies:
-      galaxy_to_halo[gid] = int(hid)
-
-  from collections import defaultdict
   halo_to_galaxy_indices: Dict[int, List[int]] = defaultdict(list)
-  for gid, hid in enumerate(galaxy_to_halo.tolist()):
-    if hid >= 0:
-      halo_to_galaxy_indices[int(hid)].append(gid)
-  unique_halos = sorted({hid for hid in matches.values() if hid is not None and hid >= 0})
+  matches: Dict[int, int] = {}
+
+  for gid, stars in galaxy_star_sets.items():
+    counts: Counter[int] = Counter()
+    for pid in stars:
+      hid = exclusive_star_map.get(int(pid))
+      if hid is not None:
+        counts[hid] += 1
+
+    if not counts:
+      continue
+
+    best_hid, _ = max(
+      counts.items(),
+      key=lambda item: (catalog.depths.get(int(item[0]), 0), item[1], -int(item[0]))
+    )
+    matches[gid] = int(best_hid)
+    if 0 <= gid < num_original_galaxies:
+      galaxy_to_halo[gid] = int(best_hid)
+      halo_to_galaxy_indices[int(best_hid)].append(gid)
+
+  unique_halos = sorted(halo_to_galaxy_indices.keys())
 
   if 'AHF_halo_id' not in manager.galaxies:
     manager.galaxies['AHF_halo_id'] = -1

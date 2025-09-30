@@ -86,7 +86,27 @@ def _union_arrays(a: np.ndarray, b: np.ndarray) -> np.ndarray:
   return np.union1d(a, b)
 
 
-def read_ahf_particles(path: Path) -> Tuple[Dict[int, Dict[str, Set[int]]], Dict[int, Set[int]]]:
+def _prepare_index_lookup(index_array: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+  if index_array.size == 0:
+    return _empty_array(), _empty_array()
+  sorter = np.argsort(index_array)
+  return index_array[sorter], sorter
+
+
+def _map_pid_array(pid_array: np.ndarray, lookup: Tuple[np.ndarray, np.ndarray]) -> Tuple[np.ndarray, int]:
+  if pid_array.size == 0:
+    return _empty_array(), 0
+  values, sorter = lookup
+  if values.size == 0:
+    return _empty_array(), pid_array.size
+  positions = np.searchsorted(values, pid_array)
+  valid_mask = (positions < values.size) & (values[positions] == pid_array)
+  matched = sorter[positions[valid_mask]] if valid_mask.any() else _empty_array()
+  missing = pid_array.size - matched.size
+  return matched, missing
+
+
+def read_ahf_particles(path: Path) -> Tuple[Dict[int, Dict[str, np.ndarray]], Dict[int, np.ndarray]]:
   """Parse an ``AHF_particles`` catalogue."""
   memberships: Dict[int, Dict[str, Set[int]]] = {}
   star_owner: Dict[int, Set[int]] = {}
@@ -141,7 +161,7 @@ def read_ahf_particles(path: Path) -> Tuple[Dict[int, Dict[str, Set[int]]], Dict
   for pid, owners in list(star_owner.items()):
     star_owner[pid] = _to_sorted_array(owners)
 
-  return memberships, star_owner
+    return memberships, star_owner
 
 
 def read_ahf_hierarchy(particles_path: Path, halos_path: Optional[Path] = None) -> Tuple[Dict[int, int], Dict[int, List[int]]]:
@@ -266,8 +286,8 @@ class AHFCatalog:
           matches[gid] = best
     return matches
 
-  def _compute_exclusives_for_nodes(self, nodes: Set[int], selected: Set[int]) -> Dict[int, Dict[str, Set[int]]]:
-    exclusives_local: Dict[int, Dict[str, Set[int]]] = {}
+  def _compute_exclusives_for_nodes(self, nodes: Set[int], selected: Set[int]) -> Dict[int, Dict[str, np.ndarray]]:
+    exclusives_local: Dict[int, Dict[str, np.ndarray]] = {}
 
     def compute(hid: int) -> Dict[str, np.ndarray]:
       if hid in exclusives_local:
@@ -292,7 +312,7 @@ class AHFCatalog:
 
     return exclusives_local
 
-  def compute_exclusive_baryons(self, selected_halos: Iterable[int], n_jobs: int = 1) -> Dict[int, Dict[str, Set[int]]]:
+  def compute_exclusive_baryons(self, selected_halos: Iterable[int], n_jobs: int = 1) -> Dict[int, Dict[str, np.ndarray]]:
     selected = set(selected_halos)
     host_to_nodes: Dict[int, Set[int]] = {}
     for hid in selected:
@@ -423,7 +443,7 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
   exclusives = catalog.compute_exclusive_baryons(selected_halos, n_jobs=n_jobs)
   dm_sets = catalog.gather_dm_sets(selected_halos)
 
-  index_arrays = {ptype: manager[ptype].index.to_numpy(dtype=np.int64) for ptype in c.ptypes.keys()}
+  index_lookup = {ptype: _prepare_index_lookup(manager[ptype].index.to_numpy(dtype=np.int64)) for ptype in c.ptypes.keys()}
   for ptype in c.ptypes.keys():
     manager[ptype]['GalID'] = -1
 
@@ -449,14 +469,14 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
       pid_array = baryons.get(ptype, _empty_array())
       if pid_array.size == 0:
         continue
-      valid = np.intersect1d(pid_array, index_arrays[ptype], assume_unique=False)
-      local_missing[ptype] += pid_array.size - valid.size
+      valid, missing = _map_pid_array(pid_array, index_lookup[ptype])
+      local_missing[ptype] += missing
       update_map[ptype] = valid
 
     dm_array = dm_sets.get(hid, _empty_array())
     if dm_array.size:
-      valid_dm = np.intersect1d(dm_array, index_arrays['dm'], assume_unique=False)
-      local_missing['dm'] += dm_array.size - valid_dm.size
+      valid_dm, missing_dm = _map_pid_array(dm_array, index_lookup['dm'])
+      local_missing['dm'] += missing_dm
       update_map['dm'] = valid_dm
 
     return gid, update_map, local_missing
@@ -500,7 +520,7 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
   manager.halos = pd.DataFrame(index=manager.haloIDs)
   manager.galaxies = pd.DataFrame(index=np.arange(len(payloads)))
 
-  index_arrays = {ptype: manager[ptype].index.to_numpy(dtype=np.int64) for ptype in c.ptypes.keys()}
+  index_lookup = {ptype: _prepare_index_lookup(manager[ptype].index.to_numpy(dtype=np.int64)) for ptype in c.ptypes.keys()}
   missing_counts = {'gas': 0, 'star': 0, 'bh': 0, 'dm': 0}
 
   for gid, (node_id, host_id, baryons, dm_set) in tqdm(enumerate(payloads), total=len(payloads), desc='Assigning AHF-FAST galaxies', unit='gal', leave=False):
@@ -513,15 +533,15 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
       pid_array = baryons.get(ptype, _empty_array())
       if pid_array.size == 0:
         continue
-      valid = np.intersect1d(pid_array, index_arrays[ptype], assume_unique=False)
-      missing_counts[ptype] += pid_array.size - valid.size
+      valid, missing = _map_pid_array(pid_array, index_lookup[ptype])
+      missing_counts[ptype] += missing
       if valid.size:
         manager[ptype].loc[valid, 'GalID'] = gid
         manager[ptype].loc[valid, 'HaloID'] = host_id
 
     if dm_set.size:
-      valid_dm = np.intersect1d(dm_set, index_arrays['dm'], assume_unique=False)
-      missing_counts['dm'] += dm_set.size - valid_dm.size
+      valid_dm, missing_dm = _map_pid_array(dm_set, index_lookup['dm'])
+      missing_counts['dm'] += missing_dm
       if valid_dm.size:
         manager['dm'].loc[valid_dm, 'GalID'] = gid
         manager['dm'].loc[valid_dm, 'HaloID'] = host_id

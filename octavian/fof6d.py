@@ -5,6 +5,9 @@ import unyt
 from sklearn.neighbors import NearestNeighbors
 import octavian.constants as c
 from joblib import Parallel, delayed
+from tqdm.auto import tqdm
+
+from octavian.ahf import tqdm_joblib
 
 from typing import Optional, TYPE_CHECKING
 if TYPE_CHECKING:
@@ -179,10 +182,17 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
 
   fof_halos['GalID'] = 0
   kernel_table = create_kernel_table(fof_LL)
-  grouped = fof_halos.groupby(by='HaloID')
+  grouped = list(fof_halos.groupby(by='HaloID'))
 
   backend = 'threading' if nproc != 1 else 'loky'
-  galaxies = Parallel(n_jobs=nproc, backend=backend)(delayed(run_fof6d_in_halo)(halo, kernel_table, c.MINIMUM_STARS_PER_GALAXY, fof_LL, vel_LL) for idx, halo in grouped)
+  if len(grouped) == 0:
+    galaxies = []
+  else:
+    with tqdm_joblib(tqdm(total=len(grouped), desc='FoF6D halos', unit='halo', leave=False)):
+      galaxies = Parallel(n_jobs=nproc, backend=backend)(
+        delayed(run_fof6d_in_halo)(halo, kernel_table, c.MINIMUM_STARS_PER_GALAXY, fof_LL, vel_LL)
+        for _, halo in grouped
+      )
   galaxies = [galaxy for galaxy_list in galaxies for galaxy in galaxy_list if len(galaxy_list) != 0]
 
   for ptype in ['gas', 'dm', 'star', 'bh']:

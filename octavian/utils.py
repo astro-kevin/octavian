@@ -41,27 +41,51 @@ def _ensure_position_units(series: pd.Series, target_unit: unyt.unyt_unit, regis
 
 def wrap_positions(data_manager: DataManager) -> None:
   boxsize = data_manager.simulation['boxsize']/data_manager.simulation['h']
-  position_unit = unyt.unyt_quantity(1., 'kpc*a', registry=data_manager.units.registry).units
+  half_box = 0.5 * boxsize
+  registry = data_manager.units.registry
+  position_unit = unyt.unyt_quantity(1., 'kpc*a', registry=registry).units
 
-  # select halos with particles near boundary
-  halos_to_wrap = {}
+  halos_to_wrap = {direction: set() for direction in ['x', 'y', 'z']}
+
   for ptype in ['gas', 'dm', 'star', 'bh']:
     data_manager.load_property('pos', ptype)
+    frame = data_manager[ptype]
+    if frame.empty:
+      continue
+
+    halo_ids = frame['HaloID'].to_numpy()
+    if halo_ids.size == 0:
+      continue
+
+    pos_columns = {}
     for direction in ['x', 'y', 'z']:
-      series = data_manager[ptype][direction]
-      data_manager[ptype].loc[:, direction] = _ensure_position_units(series, position_unit, data_manager.units.registry)
+      series = frame[direction]
+      pos_columns[direction] = _ensure_position_units(series, position_unit, registry).to_value(position_unit)
 
-  data = pd.concat([data_manager[ptype] for ptype in ['gas', 'dm', 'star', 'bh']])
-  halos_grouped = data.groupby(by='HaloID')
-  for direction in ['x', 'y', 'z']:
-    check_wrap = (halos_grouped[direction].max() - halos_grouped[direction].min()) > 0.5*boxsize
-    halos_to_wrap[direction] = check_wrap[check_wrap].index.unique()
+    local = pd.DataFrame(pos_columns)
+    local['HaloID'] = halo_ids
+    grouped = local.groupby('HaloID', sort=False)
 
-  # wrap positions
+    for direction in ['x', 'y', 'z']:
+      span = grouped[direction].max() - grouped[direction].min()
+      to_wrap = span.index[span > half_box]
+      if len(to_wrap):
+        halos_to_wrap[direction].update(to_wrap.to_numpy())
+
   for ptype in ['gas', 'dm', 'star', 'bh']:
-    halos_grouped = data_manager[ptype].groupby(by='HaloID')
+    frame = data_manager[ptype]
+    if frame.empty:
+      continue
+    halo_ids = frame['HaloID'].to_numpy()
+    if halo_ids.size == 0:
+      continue
     for direction in ['x', 'y', 'z']:
-      in_halos_to_wrap = np.isin(data_manager[ptype]['HaloID'], halos_to_wrap[direction])
-      too_high = data_manager[ptype][direction] > 0.5*boxsize
-
-      data_manager[ptype].loc[in_halos_to_wrap & too_high, direction] -= boxsize
+      if not halos_to_wrap[direction]:
+        continue
+      in_halos = np.isin(halo_ids, list(halos_to_wrap[direction]))
+      if not in_halos.any():
+        continue
+      coords = _ensure_position_units(frame[direction], position_unit, registry).to_value(position_unit)
+      mask = in_halos & (coords > half_box)
+      if mask.any():
+        frame.loc[mask, direction] = coords[mask] - boxsize

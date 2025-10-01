@@ -22,17 +22,21 @@ def _ensure_position_units(series: pd.Series, target_unit: unyt.unyt_unit, regis
   if values.dtype == object:
     converted = []
     for val in values:
-      if hasattr(val, 'to'):
-        try:
-          converted.append(val.to(target_unit).value)
-        except Exception:
-          base = val.value if hasattr(val, 'value') else float(val)
-          converted.append(base)
+      if isinstance(val, unyt.unyt_array):
+        converted.append(val.to_value(target_unit))
+      elif isinstance(val, unyt.unyt_quantity):
+        converted.append(val.to_value(target_unit))
+      elif hasattr(val, 'to_value'):
+        converted.append(val.to_value(target_unit))
+      elif hasattr(val, 'to'):
+        converted.append(val.to(target_unit).value)
+      elif hasattr(val, 'units') and hasattr(val, 'value'):
+        converted.append(unyt.unyt_quantity(val.value, val.units, registry=registry).to_value(target_unit))
       else:
-        converted.append(val)
-    return unyt.unyt_array(converted, target_unit, registry=registry)
+        converted.append(float(val))
+    return unyt.unyt_array(np.asarray(converted, dtype=np.float64), target_unit, registry=registry)
 
-  return unyt.unyt_array(values, target_unit, registry=registry)
+  return unyt.unyt_array(values.astype(np.float64, copy=False), target_unit, registry=registry)
 
 
 def wrap_positions(data_manager: DataManager) -> None:

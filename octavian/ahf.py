@@ -86,13 +86,16 @@ def _union_arrays(a: np.ndarray, b: np.ndarray) -> np.ndarray:
   return np.union1d(a, b)
 
 
-def _prepare_index_lookup(index_array: np.ndarray) -> np.ndarray:
-  if index_array.size == 0:
-    return _empty_array()
-  return np.sort(index_array)
+def _prepare_index_lookup(frame: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+  if 'pid' not in frame or frame.empty:
+    return _empty_array(), _empty_array()
+  pid_values = frame['pid'].to_numpy(dtype=np.int64, copy=False)
+  indices = frame.index.to_numpy(dtype=np.int64, copy=False)
+  order = np.argsort(pid_values)
+  return pid_values[order], indices[order]
 
 
-def _map_pid_array(pid_array: np.ndarray, values: np.ndarray) -> Tuple[np.ndarray, int]:
+def _map_pid_array(pid_array: np.ndarray, values: np.ndarray, indices: np.ndarray) -> Tuple[np.ndarray, int]:
   if pid_array.size == 0:
     return _empty_array(), 0
   if values.size == 0:
@@ -105,9 +108,12 @@ def _map_pid_array(pid_array: np.ndarray, values: np.ndarray) -> Tuple[np.ndarra
     pid_within = pid_array[within]
     matches_within = values[pos_within] == pid_within
     matches[within] = matches_within
-  matched = values[positions[matches]] if matches.any() else _empty_array()
-  missing = pid_array.size - matched.size
-  return matched, missing
+  if matches.any():
+    matched_indices = indices[positions[matches]]
+  else:
+    matched_indices = _empty_array()
+  missing = pid_array.size - matched_indices.size
+  return matched_indices, missing
 
 
 def read_ahf_particles(path: Path) -> Tuple[Dict[int, Dict[str, np.ndarray]], Dict[int, np.ndarray]]:
@@ -515,7 +521,7 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
   manager.halos = pd.DataFrame(index=manager.haloIDs)
   manager.galaxies = pd.DataFrame(index=np.arange(len(payloads)))
 
-  index_lookup = {ptype: _prepare_index_lookup(manager[ptype].index.to_numpy(dtype=np.int64)) for ptype in c.ptypes.keys()}
+  index_lookup = {ptype: _prepare_index_lookup(manager[ptype]) for ptype in c.ptypes.keys()}
   missing_counts = {'gas': 0, 'star': 0, 'bh': 0, 'dm': 0}
 
   for gid, (node_id, host_id, baryons, dm_set) in tqdm(enumerate(payloads), total=len(payloads), desc='Assigning AHF-FAST galaxies', unit='gal', leave=False):
@@ -528,14 +534,16 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
       pid_array = baryons.get(ptype, _empty_array())
       if pid_array.size == 0:
         continue
-      valid, missing = _map_pid_array(pid_array, index_lookup[ptype])
+      lookup_values, lookup_indices = index_lookup[ptype]
+      valid, missing = _map_pid_array(pid_array, lookup_values, lookup_indices)
       missing_counts[ptype] += missing
       if valid.size:
         manager[ptype].loc[valid, 'GalID'] = gid
         manager[ptype].loc[valid, 'HaloID'] = host_id
 
     if dm_set.size:
-      valid_dm, missing_dm = _map_pid_array(dm_set, index_lookup['dm'])
+      dm_values, dm_indices = index_lookup['dm']
+      valid_dm, missing_dm = _map_pid_array(dm_set, dm_values, dm_indices)
       missing_counts['dm'] += missing_dm
       if valid_dm.size:
         manager['dm'].loc[valid_dm, 'GalID'] = gid

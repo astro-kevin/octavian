@@ -116,7 +116,14 @@ class OCTAVIAN:
     halo_map, missing = apply_ahf_matching(data_manager, catalog, n_jobs=n_jobs)
     self._log_duration(t1)
     matched = len(halo_map)
-    print(f"    Matched {matched} AHF halos (missing particles: {missing}).", flush=True)
+    merged_halos = sum(1 for count in halo_map.values() if count > 1)
+    merged_galaxies = sum((count - 1) for count in halo_map.values() if count > 1)
+    total_galaxies = sum(halo_map.values())
+    print(
+      f"    Matched {matched} AHF halos covering {total_galaxies} FoF galaxies "
+      f"(missing particles: {missing}; merged {merged_galaxies} FoF galaxies across {merged_halos} halos).",
+      flush=True
+    )
     step += 1
     return step
 

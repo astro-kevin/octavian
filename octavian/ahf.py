@@ -458,7 +458,17 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
   halo_to_galaxy_indices: Dict[int, List[int]] = defaultdict(list)
   matches: Dict[int, int] = {}
 
-  for gid, stars in galaxy_star_sets.items():
+  match_iterable = galaxy_star_sets.items()
+  if len(galaxy_star_sets) > 1:
+    match_iterable = tqdm(
+      galaxy_star_sets.items(),
+      total=len(galaxy_star_sets),
+      desc='Matching galaxies to AHF halos',
+      unit='gal',
+      leave=False
+    )
+
+  for gid, stars in match_iterable:
     counts: Counter[int] = Counter()
     for pid in stars:
       hid = exclusive_star_map.get(int(pid))
@@ -537,6 +547,12 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
       lookup_values, lookup_indices = index_lookup[ptype]
       valid, missing = _map_pid_array(pid_array, lookup_values, lookup_indices)
       missing_counts[ptype] += missing
+      if missing:
+        missing_pid_sample = np.setdiff1d(pid_array, lookup_values, assume_unique=False)[:10]
+        raise RuntimeError(
+          f"AHF-FAST assignment failed: {missing} {ptype} particles missing for galaxy {gid} "
+          f"(node={node_id}, host={host_id}). Sample PIDs: {missing_pid_sample.tolist()}"
+        )
       if valid.size:
         manager[ptype].loc[valid, 'GalID'] = gid
         manager[ptype].loc[valid, 'HaloID'] = host_id
@@ -545,6 +561,12 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
       dm_values, dm_indices = index_lookup['dm']
       valid_dm, missing_dm = _map_pid_array(dm_set, dm_values, dm_indices)
       missing_counts['dm'] += missing_dm
+      if missing_dm:
+        missing_dm_sample = np.setdiff1d(dm_set, dm_values, assume_unique=False)[:10]
+        raise RuntimeError(
+          f"AHF-FAST assignment failed: {missing_dm} dm particles missing for galaxy {gid} "
+          f"(node={node_id}, host={host_id}). Sample PIDs: {missing_dm_sample.tolist()}"
+        )
       if valid_dm.size:
         manager['dm'].loc[valid_dm, 'GalID'] = gid
         manager['dm'].loc[valid_dm, 'HaloID'] = host_id

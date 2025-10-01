@@ -184,7 +184,7 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
   kernel_table = create_kernel_table(fof_LL)
   grouped = list(fof_halos.groupby(by='HaloID'))
 
-  backend = 'threading' if nproc != 1 else 'loky'
+  backend = 'loky'
   if len(grouped) == 0:
     galaxies = []
   else:

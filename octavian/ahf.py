@@ -165,7 +165,7 @@ def read_ahf_particles(path: Path) -> Tuple[Dict[int, Dict[str, np.ndarray]], Di
   for pid, owners in list(star_owner.items()):
     star_owner[pid] = _to_sorted_array(owners)
 
-    return memberships, star_owner
+  return memberships, star_owner
 
 
 def read_ahf_hierarchy(particles_path: Path, halos_path: Optional[Path] = None) -> Tuple[Dict[int, int], Dict[int, List[int]]]:
@@ -447,7 +447,7 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
     for pid in stars:
       exclusive_star_map[int(pid)] = int(hid)
 
-  num_original_galaxies = len(data_manager.galaxies)
+  num_original_galaxies = len(manager.galaxies)
   galaxy_to_halo = np.full(num_original_galaxies, -1, dtype=np.int64)
   halo_to_galaxy_indices: Dict[int, List[int]] = defaultdict(list)
   matches: Dict[int, int] = {}

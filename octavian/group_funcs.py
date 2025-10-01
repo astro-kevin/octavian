@@ -6,6 +6,7 @@ from sklearn.neighbors import NearestNeighbors
 import octavian.constants as c
 from functools import partial
 from astropy import constants as const
+from tqdm.auto import tqdm
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -275,12 +276,16 @@ def calculate_group_properties(data_manager: DataManager) -> None:
   group_props_columns = ['HaloID', 'GalID', 'ptype', 'mass', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'potential']
   columns_to_drop = ['vx', 'vy', 'vz', 'potential']
 
+  total_progress_steps = 20
+  progress = tqdm(total=total_progress_steps, desc='Computing group properties', unit='task', leave=False)
+
   # total
   for collection in collections:
     data = pd.concat([data_manager[ptype][group_props_columns] for ptype in c.ptypes.keys()], ignore_index=True)
     if collection == 'galaxies': data = data.loc[data['GalID'] != -1]
     calculateGroupProperties_common(data_manager, data, collection, 'total')
     data_manager[collection] = data_manager[collection].copy()
+    progress.update(1)
 
   data = None
 
@@ -290,6 +295,7 @@ def calculate_group_properties(data_manager: DataManager) -> None:
     if collection == 'galaxies': data = data.loc[data['GalID'] != -1]
     calculateGroupProperties_common(data_manager, data, collection, 'dm')
     data_manager[collection] = data_manager[collection].copy()
+    progress.update(1)
   
   data = None
   data_manager['dm'].drop(columns=columns_to_drop, inplace=True)
@@ -300,6 +306,7 @@ def calculate_group_properties(data_manager: DataManager) -> None:
     if collection == 'galaxies': data = data.loc[data['GalID'] != -1]
     calculateGroupProperties_common(data_manager, data, collection, 'baryon')
     data_manager[collection] = data_manager[collection].copy()
+    progress.update(1)
   
   data = None
 
@@ -309,6 +316,7 @@ def calculate_group_properties(data_manager: DataManager) -> None:
     if collection == 'galaxies': data = data.loc[data['GalID'] != -1]
     calculateGroupProperties_common(data_manager, data, collection, 'gas')
     data_manager[collection] = data_manager[collection].copy()
+    progress.update(1)
   
   data = None
   data_manager['gas'].drop(columns=columns_to_drop, inplace=True)
@@ -322,6 +330,7 @@ def calculate_group_properties(data_manager: DataManager) -> None:
     if collection == 'galaxies': data = data.loc[data['GalID'] != -1]
     calculateGroupProperties_gas(data_manager, data, collection)
     data_manager[collection] = data_manager[collection].copy()
+    progress.update(1)
 
   # star
   for collection in collections:
@@ -329,6 +338,7 @@ def calculate_group_properties(data_manager: DataManager) -> None:
     if collection == 'galaxies': data = data.loc[data['GalID'] != -1]
     calculateGroupProperties_common(data_manager, data, collection, 'star')
     data_manager[collection] = data_manager[collection].copy()
+    progress.update(1)
 
   data = None
   data_manager['star'].drop(columns=columns_to_drop, inplace=True)
@@ -342,6 +352,7 @@ def calculate_group_properties(data_manager: DataManager) -> None:
     if collection == 'galaxies': data = data.loc[data['GalID'] != -1]
     calculateGroupProperties_star(data_manager, data, collection)
     data_manager[collection] = data_manager[collection].copy()
+    progress.update(1)
 
   # bh
   for collection in collections:
@@ -349,6 +360,7 @@ def calculate_group_properties(data_manager: DataManager) -> None:
     if collection == 'galaxies': data = data.loc[data['GalID'] != -1]
     calculateGroupProperties_common(data_manager, data, collection, 'bh')
     data_manager[collection] = data_manager[collection].copy()
+    progress.update(1)
   
   data = None
   data_manager['bh'].drop(columns=columns_to_drop, inplace=True)
@@ -362,6 +374,7 @@ def calculate_group_properties(data_manager: DataManager) -> None:
     if collection == 'galaxies': data = data.loc[data['GalID'] != -1]
     calculateGroupProperties_bh(data_manager, data, collection)
     data_manager[collection] = data_manager[collection].copy()
+    progress.update(1)
 
   # aperture
   aperture_props_columns = ['HaloID', 'GalID', 'ptype', 'mass', 'x',  'y', 'z']
@@ -395,4 +408,7 @@ def calculate_group_properties(data_manager: DataManager) -> None:
   data_manager['galaxies']['mass_total_30kpc'] = data_manager['galaxies'][['mass_gas_30kpc', 'mass_dm_30kpc', 'mass_star_30kpc', 'mass_bh_30kpc']].sum(axis=1)
 
   
+  progress.update(1)
   calculate_local_densities(data_manager)
+  progress.update(1)
+  progress.close()

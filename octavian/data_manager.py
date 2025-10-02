@@ -30,7 +30,7 @@ class DataManager:
     else:
       self.use_polars = bool(use_polars)
     self._polars_tables: Dict[str, "pl.DataFrame"] = {}
-    self._polars_units: Dict[str, Dict[str, unyt.unyt_unit]] = {}
+    self._polars_units: Dict[str, Dict[str, unyt.Unit]] = {}
 
     self.load_simulation_constants()
 
@@ -255,7 +255,7 @@ class DataManager:
       self._polars_tables.pop(ptype, None)
       self._polars_units.pop(ptype, None)
 
-  def _convert_series_to_numeric(self, series: pd.Series) -> tuple[np.ndarray, Optional[unyt.unyt_unit]]:
+  def _convert_series_to_numeric(self, series: pd.Series) -> tuple[np.ndarray, Optional[unyt.Unit]]:
     if series.empty:
       return series.to_numpy(), None
     values = series.to_numpy()
@@ -280,7 +280,7 @@ class DataManager:
     if ptype not in self._polars_tables:
       frame = self[ptype]
       data: Dict[str, np.ndarray] = {}
-      units: Dict[str, unyt.unyt_unit] = {}
+      units: Dict[str, unyt.Unit] = {}
       if include_index:
         data['pid'] = frame.index.to_numpy(dtype=np.int64, copy=False)
       for column in frame.columns:

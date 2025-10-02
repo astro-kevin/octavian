@@ -4,17 +4,32 @@ import h5py
 import unyt
 from astropy.cosmology import FlatLambdaCDM
 from sympy import sympify
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Dict, Any
+
+try:
+  import polars as pl  # type: ignore
+  HAS_POLARS = True
+except Exception:  # pragma: no cover - optional dependency
+  pl = None  # type: ignore
+  HAS_POLARS = False
 
 import octavian.constants as c
 
 
 class DataManager:
-  def __init__(self, snapfile: str, fraction: Sequence[float] = (0, 1), mode: str = 'fof', include_unassigned: Optional[bool] = None):
+  def __init__(self, snapfile: str, fraction: Sequence[float] = (0, 1), mode: str = 'fof', include_unassigned: Optional[bool] = None, use_polars: bool = False):
     self.snapfile = snapfile
     self.mode = mode.lower()
     self.start_fraction = fraction[0]
     self.end_fraction = fraction[1]
+
+    if not HAS_POLARS:
+      self.use_polars = False
+    elif use_polars is None:
+      self.use_polars = True
+    else:
+      self.use_polars = bool(use_polars)
+    self._polars_tables: Dict[str, "pl.DataFrame"] = {}
 
     self.load_simulation_constants()
 
@@ -40,7 +55,9 @@ class DataManager:
      return getattr(self, name)
   
   def __setitem__(self, name, value):
-    return setattr(self, name, value)
+    setattr(self, name, value)
+    if self.use_polars and isinstance(name, str) and name in c.ptypes.keys():
+      self._invalidate_polars(name)
   
   def __delitem__(self, name):
     return delattr(self, name)
@@ -159,6 +176,9 @@ class DataManager:
         dataset = c.prop_aliases['bhmass'] if ptype == 'bh' else c.prop_aliases['mass']
         masses = f[id][dataset][:] * self.get_unit_conversion_factor('mass')
         self[ptype]['mass'] = masses[self[ptype].index]
+
+        if self.use_polars:
+          self._invalidate_polars(ptype)
         
         self[f'n{ptype}'] = len(masses)
         self[f'm{ptype}_total'] = np.sum(masses)
@@ -173,6 +193,8 @@ class DataManager:
       if column in frame:
         return
     self.load_property(prop, ptype)
+    if self.use_polars:
+      self._invalidate_polars(ptype)
 
   def get_prop_name(self, prop: str) -> str:
     return c.prop_aliases[prop.strip(' _').lower()]
@@ -198,6 +220,7 @@ class DataManager:
   def load_property(self, requested_prop: str, requested_ptype: str):
     prop = self.get_prop_name(requested_prop)
     ptype = self.get_ptype_name(requested_ptype)
+    ptype_key = requested_ptype.strip(' _').lower()
     column = self.get_column_name(requested_prop)
 
     with h5py.File(self.snapfile) as f:
@@ -216,3 +239,38 @@ class DataManager:
         else:
           factor = self.get_unit_conversion_factor(requested_prop)
           self[requested_ptype][column] = data[indexer] * factor
+    if self.use_polars:
+      self._invalidate_polars(ptype_key)
+
+  # -- Polars helpers --------------------------------------------------
+
+  def _invalidate_polars(self, ptype: Optional[str] = None) -> None:
+    if not self.use_polars:
+      return
+    if ptype is None:
+      self._polars_tables.clear()
+    elif ptype in self._polars_tables:
+      self._polars_tables.pop(ptype, None)
+
+  def get_polars_table(self, ptype: str, *, include_index: bool = True) -> "pl.DataFrame":
+    if not self.use_polars:
+      raise RuntimeError('Polars tables requested but Polars mode is disabled.')
+    if ptype not in c.ptypes.keys():
+      raise KeyError(f'Unknown particle type: {ptype}')
+
+    if ptype not in self._polars_tables:
+      frame = self[ptype]
+      if include_index:
+        pdf = frame.reset_index().rename(columns={'index': 'pid'})
+      else:
+        pdf = frame
+      self._polars_tables[ptype] = pl.from_pandas(pdf)
+    return self._polars_tables[ptype].clone()
+
+  def to_polars(self) -> Dict[str, "pl.DataFrame"]:
+    if not self.use_polars:
+      raise RuntimeError('Polars tables requested but Polars mode is disabled.')
+    tables: Dict[str, "pl.DataFrame"] = {}
+    for ptype in c.ptypes.keys():
+      tables[ptype] = self.get_polars_table(ptype)
+    return tables

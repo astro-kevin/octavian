@@ -7,6 +7,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
   from octavian.data_manager import DataManager
 
+try:
+  import polars as pl  # type: ignore
+  HAS_POLARS = True
+except Exception:  # pragma: no cover - optional dependency
+  pl = None  # type: ignore
+  HAS_POLARS = False
+
 
 # handle periodic boundary for fof and CoM calculations, reset out of bounds positions during save
 def _ensure_position_units(series: pd.Series, target_unit: unyt.unyt_unit, registry) -> unyt.unyt_array:
@@ -44,6 +51,10 @@ def wrap_positions(data_manager: DataManager) -> None:
   half_box = 0.5 * boxsize
   registry = data_manager.units.registry
   position_unit = unyt.unyt_quantity(1., 'kpc*a', registry=registry).units
+
+  use_polars = getattr(data_manager, 'use_polars', False)
+  if use_polars and not HAS_POLARS:
+    raise RuntimeError('Polars requested for wrap_positions but Polars is unavailable.')
 
   halos_to_wrap = {direction: set() for direction in ['x', 'y', 'z']}
 
@@ -89,3 +100,8 @@ def wrap_positions(data_manager: DataManager) -> None:
       mask = in_halos & (coords > half_box)
       if mask.any():
         frame.loc[mask, direction] = coords[mask] - boxsize
+
+  if use_polars and HAS_POLARS:
+    for ptype in ['gas', 'dm', 'star', 'bh']:
+      table = pl.from_pandas(data_manager[ptype].reset_index().rename(columns={'index': 'pid'}))
+      data_manager._polars_tables[ptype] = table

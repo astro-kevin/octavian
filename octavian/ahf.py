@@ -15,6 +15,13 @@ from joblib import Parallel, delayed
 from joblib import parallel as joblib_parallel
 
 try:
+  import polars as pl  # type: ignore
+  HAS_POLARS = True
+except Exception:  # pragma: no cover - optional dependency
+  pl = None  # type: ignore
+  HAS_POLARS = False
+
+try:
   from tqdm.auto import tqdm
 except Exception:  # pragma: no cover - fallback when tqdm missing
   def tqdm(iterable, *args, **kwargs):  # type: ignore
@@ -432,12 +439,26 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
   if 'pid' not in stars:
     raise ValueError('Star particle IDs are required for AHF matching.')
 
-  galaxies = stars.loc[stars['GalID'] != -1]
+  use_polars = getattr(manager, 'use_polars', False)
+
   galaxy_star_sets: Dict[int, np.ndarray] = {}
-  galaxy_groups = galaxies.groupby('GalID')
-  total_groups = getattr(galaxy_groups, 'ngroups', None)
-  for gid, subset in tqdm(galaxy_groups, total=total_groups, desc='Collecting galaxy members', unit='gal', leave=False):
-    galaxy_star_sets[int(gid)] = np.unique(subset['pid'].to_numpy(dtype=np.int64))
+  if use_polars:
+    star_table = manager.get_polars_table('star')
+    galaxy_groups_pl = (
+      star_table
+      .filter(pl.col('GalID') != -1)
+      .groupby('GalID')
+      .agg(pl.col('pid').unique().alias('pid_list'))
+    )
+    for row in galaxy_groups_pl.iter_rows(named=True):
+      pid_array = np.array(row['pid_list'], dtype=np.int64)
+      galaxy_star_sets[int(row['GalID'])] = np.unique(pid_array)
+  else:
+    galaxies = stars.loc[stars['GalID'] != -1]
+    galaxy_groups = galaxies.groupby('GalID')
+    total_groups = getattr(galaxy_groups, 'ngroups', None)
+    for gid, subset in tqdm(galaxy_groups, total=total_groups, desc='Collecting galaxy members', unit='gal', leave=False):
+      galaxy_star_sets[int(gid)] = np.unique(subset['pid'].to_numpy(dtype=np.int64))
 
   if not galaxy_star_sets:
     raise ValueError('No FoF galaxies available to match against AHF halos.')
@@ -498,7 +519,6 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
 
   ahf_halo_ids = np.full(num_original_galaxies, -1, dtype=np.int64)
   ahf_host_ids = np.full(num_original_galaxies, -1, dtype=np.int64)
-
   for gid, hid in enumerate(galaxy_to_halo.tolist()):
     if hid < 0:
       continue
@@ -508,6 +528,8 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
   manager.galaxies.loc[:, 'AHF_halo_id'] = ahf_halo_ids[:len(manager.galaxies)]
   manager.galaxies.loc[:, 'AHF_host_id'] = ahf_host_ids[:len(manager.galaxies)]
   manager.galaxies.loc[:, 'AHF_matched'] = manager.galaxies['AHF_halo_id'] >= 0
+  if use_polars:
+    manager._invalidate_polars('star')
 
   missing_counts = {'gas': 0, 'star': 0, 'bh': 0, 'dm': 0}
   halo_map = {hid: len(halo_to_galaxy_indices.get(hid, [])) for hid in unique_halos}
@@ -521,6 +543,8 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
     frame = manager[ptype]
     frame['GalID'] = -1
     frame['HaloID'] = -1
+    if use_polars and HAS_POLARS:
+      manager._invalidate_polars(ptype)
 
   payloads = catalog.build_fast_payloads(min_stars, n_jobs=n_jobs)
   if not payloads:
@@ -531,8 +555,21 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
   manager.halos = pd.DataFrame(index=manager.haloIDs)
   manager.galaxies = pd.DataFrame(index=np.arange(len(payloads)))
 
-  index_lookup = {ptype: _prepare_index_lookup(manager[ptype]) for ptype in c.ptypes.keys()}
+  if use_polars and HAS_POLARS:
+    index_lookup: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for ptype in c.ptypes.keys():
+      table = manager.get_polars_table(ptype)
+      pid_values = table.select('pid').to_series().to_numpy(dtype=np.int64)
+      order = np.argsort(pid_values)
+      sorted_pids = pid_values[order]
+      index_lookup[ptype] = (sorted_pids, sorted_pids)
+  else:
+    index_lookup = {ptype: _prepare_index_lookup(manager[ptype]) for ptype in c.ptypes.keys()}
   missing_counts = {'gas': 0, 'star': 0, 'bh': 0, 'dm': 0}
+
+  updates: Dict[str, Dict[str, list[int]]] = {}
+  if use_polars:
+    updates = {ptype: {'pid': [], 'GalID': [], 'HaloID': []} for ptype in c.ptypes.keys()}
 
   for gid, (node_id, host_id, baryons, dm_set) in tqdm(enumerate(payloads), total=len(payloads), desc='Assigning AHF-FAST galaxies', unit='gal', leave=False):
     if host_id in (0, None):
@@ -554,8 +591,13 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
           f"(node={node_id}, host={host_id}). Sample PIDs: {missing_pid_sample.tolist()}"
         )
       if valid.size:
-        manager[ptype].loc[valid, 'GalID'] = gid
-        manager[ptype].loc[valid, 'HaloID'] = host_id
+    if use_polars:
+      updates[ptype]['pid'].extend(valid.tolist())
+          updates[ptype]['GalID'].extend([gid] * valid.size)
+          updates[ptype]['HaloID'].extend([host_id] * valid.size)
+        else:
+          manager[ptype].loc[valid, 'GalID'] = gid
+          manager[ptype].loc[valid, 'HaloID'] = host_id
 
     if dm_set.size:
       dm_values, dm_indices = index_lookup['dm']
@@ -568,8 +610,27 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
           f"(node={node_id}, host={host_id}). Sample PIDs: {missing_dm_sample.tolist()}"
         )
       if valid_dm.size:
-        manager['dm'].loc[valid_dm, 'GalID'] = gid
-        manager['dm'].loc[valid_dm, 'HaloID'] = host_id
+        if use_polars:
+          updates['dm']['pid'].extend(valid_dm.tolist())
+          updates['dm']['GalID'].extend([gid] * valid_dm.size)
+          updates['dm']['HaloID'].extend([host_id] * valid_dm.size)
+        else:
+          manager['dm'].loc[valid_dm, 'GalID'] = gid
+          manager['dm'].loc[valid_dm, 'HaloID'] = host_id
+
+  if use_polars:
+    for ptype in c.ptypes.keys():
+      entries = updates[ptype]
+      table = manager.get_polars_table(ptype)
+      if entries['pid']:
+        updates_df = pl.DataFrame(entries)
+        table = table.join(updates_df, on='pid', how='left', suffix='_update')
+        table = table.with_columns([
+          pl.when(pl.col('GalID_update').is_not_null()).then(pl.col('GalID_update').cast(pl.Int64)).otherwise(pl.col('GalID')).alias('GalID'),
+          pl.when(pl.col('HaloID_update').is_not_null()).then(pl.col('HaloID_update').cast(pl.Int64)).otherwise(pl.col('HaloID')).alias('HaloID')
+        ]).drop(['GalID_update', 'HaloID_update'])
+      manager[ptype] = table.drop('pid').to_pandas().set_index('pid')
+      manager._polars_tables[ptype] = table
 
   for ptype in c.ptypes.keys():
     frame = manager[ptype]

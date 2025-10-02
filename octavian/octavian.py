@@ -12,7 +12,7 @@ from octavian.ahf import load_catalog, apply_ahf_matching, build_galaxies_from_f
 
 
 class OCTAVIAN:
-  def __init__(self, dataset: PathLike, units: dict = {}, nproc: int = 1, mode: str = 'fof', ahf_particles: Optional[PathLike] = None, ahf_halos: Optional[PathLike] = None, *args, **kwargs):
+  def __init__(self, dataset: PathLike, units: dict = {}, nproc: int = 1, mode: str = 'fof', ahf_particles: Optional[PathLike] = None, ahf_halos: Optional[PathLike] = None, use_polars: Optional[bool] = None, *args, **kwargs):
     self._args = args
     self.dataset = dataset
 
@@ -27,6 +27,15 @@ class OCTAVIAN:
     self.ahf_halos = ahf_halos
     if self.mode in {'ahf', 'ahf-fast'} and self.ahf_particles is None:
       raise ValueError('AHF modes require the path to an AHF_particles catalogue.')
+
+    from octavian.group_funcs import HAS_POLARS
+
+    if not HAS_POLARS:
+      self.use_polars = False
+    elif use_polars is None:
+      self.use_polars = True
+    else:
+      self.use_polars = bool(use_polars)
 
   def _log_step(self, current: int, total: int, message: str) -> None:
     print(f"[{current}/{total}] {message}", flush=True)
@@ -45,7 +54,7 @@ class OCTAVIAN:
     step = 1
     self._log_step(step, total_steps, 'Initialising data manager...')
     t1 = perf_counter()
-    data_manager = DataManager(self.dataset, mode=self.mode)
+    data_manager = DataManager(self.dataset, mode=self.mode, use_polars=self.use_polars)
     self._log_duration(t1)
     step += 1
 
@@ -66,7 +75,7 @@ class OCTAVIAN:
 
     self._log_step(step, total_steps, 'Calculating group properties...')
     t1 = perf_counter()
-    calculate_group_properties(data_manager)
+    calculate_group_properties(data_manager, use_polars=self.use_polars)
     self._log_duration(t1)
     step += 1
 

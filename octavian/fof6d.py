@@ -7,6 +7,13 @@ import octavian.constants as c
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
+try:
+  import polars as pl  # type: ignore
+  HAS_POLARS = True
+except Exception:  # pragma: no cover - optional dependency
+  pl = None  # type: ignore
+  HAS_POLARS = False
+
 from octavian.ahf import tqdm_joblib
 
 from typing import Optional, TYPE_CHECKING
@@ -163,6 +170,8 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
   fof_LL = data_manager.mis * b
   vel_LL = 1.
 
+  use_polars = getattr(data_manager, 'use_polars', False)
+
   for ptype in ['gas', 'dm', 'star', 'bh']:
     data_manager.load_property('vel', ptype)
 
@@ -172,17 +181,58 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
 
   data_manager['gas']['temperature'] = 0.
   data_manager['gas']['dense_gas'] = (data_manager['gas']['rho'] > c.nHlim) & ((data_manager['gas']['temperature'] < c.Tlim) | (data_manager['gas']['sfr'] > 0))
-  
-  # combine dfs, reduce the gas df to common columns
-  fof_columns = ['HaloID', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'ptype']
-  fof_filter = lambda halo: len(halo) >= c.MINIMUM_STARS_PER_GALAXY
-  fof_halos = data_manager['star'].groupby('HaloID').filter(fof_filter)
-  fof_haloids = np.unique(fof_halos['HaloID'])
-  fof_halos = pd.concat([data_manager['gas'].loc[data_manager['gas']['dense_gas'], fof_columns], data_manager['star'][fof_columns], data_manager['bh'][fof_columns]]).query('HaloID in @fof_haloids')
+  if use_polars:
+    data_manager._invalidate_polars('gas')
 
-  fof_halos['GalID'] = 0
+  fof_columns = ['HaloID', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'ptype']
+  fof_columns_polars = ['pid'] + fof_columns
+  fof_filter = lambda halo: len(halo) >= c.MINIMUM_STARS_PER_GALAXY
+
+  if use_polars:
+    star_table = data_manager.get_polars_table('star')
+    gas_table = data_manager.get_polars_table('gas')
+    bh_table = data_manager.get_polars_table('bh')
+
+    star_counts = star_table.groupby('HaloID').agg(pl.count().alias('count'))
+    valid_haloids = (
+      star_counts
+      .filter(pl.col('count') >= c.MINIMUM_STARS_PER_GALAXY)
+      .select('HaloID')
+      .to_series()
+      .to_numpy()
+    )
+
+    if valid_haloids.size == 0:
+      grouped = []
+    else:
+      dense_gas = gas_table.filter(pl.col('dense_gas')).select(fof_columns_polars)
+      star_subset = star_table.select(fof_columns_polars)
+      bh_subset = bh_table.select(fof_columns_polars)
+      fof_halos_pl = pl.concat([dense_gas, star_subset, bh_subset], how='vertical_relaxed')
+      fof_halos_pl = fof_halos_pl.filter(pl.col('HaloID').is_in(valid_haloids))
+
+      if fof_halos_pl.is_empty():
+        grouped = []
+      else:
+        fof_halos_pl = fof_halos_pl.with_columns(pl.lit(0).alias('GalID'))
+        halo_partitions = fof_halos_pl.partition_by('HaloID', maintain_order=True, as_dict=False)
+        grouped = []
+        for part in halo_partitions:
+          halo_id_value = int(part['HaloID'][0]) if part.height > 0 else None
+          grouped.append((halo_id_value, part.to_pandas().set_index('pid')))
+  else:
+    fof_halos = data_manager['star'].groupby('HaloID').filter(fof_filter)
+    fof_haloids = np.unique(fof_halos['HaloID'])
+    fof_halos = pd.concat([
+      data_manager['gas'].loc[data_manager['gas']['dense_gas'], fof_columns],
+      data_manager['star'][fof_columns],
+      data_manager['bh'][fof_columns]
+    ]).query('HaloID in @fof_haloids')
+
+    fof_halos['GalID'] = 0
+    grouped = list(fof_halos.groupby(by='HaloID'))
+
   kernel_table = create_kernel_table(fof_LL)
-  grouped = list(fof_halos.groupby(by='HaloID'))
 
   backend = 'loky'
   if len(grouped) == 0:
@@ -190,14 +240,20 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
   else:
     with tqdm_joblib(tqdm(total=len(grouped), desc='FoF6D halos', unit='halo', leave=False)):
       galaxies = Parallel(n_jobs=nproc, backend=backend)(
-        delayed(run_fof6d_in_halo)(halo, kernel_table, c.MINIMUM_STARS_PER_GALAXY, fof_LL, vel_LL)
-        for _, halo in grouped
+        delayed(run_fof6d_in_halo)(halo_df,
+                                   kernel_table,
+                                   c.MINIMUM_STARS_PER_GALAXY,
+                                   fof_LL,
+                                   vel_LL)
+        for _, halo_df in grouped
       )
   galaxies = [galaxy for galaxy_list in galaxies for galaxy in galaxy_list if len(galaxy_list) != 0]
 
   for ptype in ['gas', 'dm', 'star', 'bh']:
     data_manager[ptype]['GalID'] = -1
-  
+    if use_polars:
+      data_manager._invalidate_polars(ptype)
+
   for i, galaxy in enumerate(galaxies):
     for ptype_id, ptype_indexes in galaxy:
       data_manager[c.ptype_names[ptype_id]].loc[ptype_indexes, 'GalID'] = i

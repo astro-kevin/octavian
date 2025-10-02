@@ -17,7 +17,7 @@ import octavian.constants as c
 
 
 class DataManager:
-  def __init__(self, snapfile: str, fraction: Sequence[float] = (0, 1), mode: str = 'fof', include_unassigned: Optional[bool] = None, use_polars: bool = False):
+  def __init__(self, snapfile: str, fraction: Sequence[float] = (0, 1), mode: str = 'fof', include_unassigned: Optional[bool] = None, use_polars: Optional[bool] = None):
     self.snapfile = snapfile
     self.mode = mode.lower()
     self.start_fraction = fraction[0]
@@ -30,6 +30,7 @@ class DataManager:
     else:
       self.use_polars = bool(use_polars)
     self._polars_tables: Dict[str, "pl.DataFrame"] = {}
+    self._polars_units: Dict[str, Dict[str, unyt.unyt_unit]] = {}
 
     self.load_simulation_constants()
 
@@ -249,10 +250,28 @@ class DataManager:
       return
     if ptype is None:
       self._polars_tables.clear()
+      self._polars_units.clear()
     elif ptype in self._polars_tables:
       self._polars_tables.pop(ptype, None)
+      self._polars_units.pop(ptype, None)
 
-  def get_polars_table(self, ptype: str, *, include_index: bool = True) -> "pl.DataFrame":
+  def _convert_series_to_numeric(self, series: pd.Series) -> tuple[np.ndarray, Optional[unyt.unyt_unit]]:
+    if series.empty:
+      return series.to_numpy(), None
+    values = series.to_numpy()
+    if isinstance(values, unyt.unyt_array):
+      unit = values.units
+      return values.to_value(unit), unit
+    first = series.iloc[0]
+    if isinstance(first, unyt.unyt_quantity):
+      unit = first.units
+      return np.array([val.to_value(unit) for val in series], dtype=np.float64), unit
+    if hasattr(first, 'to_value') and hasattr(first, 'units'):
+      unit = first.units
+      return np.array([val.to_value(unit) for val in series], dtype=np.float64), unit
+    return series.to_numpy(), None
+
+  def get_polars_table(self, ptype: str, *, include_index: bool = True, mutable: bool = False) -> "pl.DataFrame":
     if not self.use_polars:
       raise RuntimeError('Polars tables requested but Polars mode is disabled.')
     if ptype not in c.ptypes.keys():
@@ -260,12 +279,35 @@ class DataManager:
 
     if ptype not in self._polars_tables:
       frame = self[ptype]
+      data: Dict[str, np.ndarray] = {}
+      units: Dict[str, unyt.unyt_unit] = {}
       if include_index:
-        pdf = frame.reset_index().rename(columns={'index': 'pid'})
-      else:
-        pdf = frame
-      self._polars_tables[ptype] = pl.from_pandas(pdf)
-    return self._polars_tables[ptype].clone()
+        data['pid'] = frame.index.to_numpy(dtype=np.int64, copy=False)
+      for column in frame.columns:
+        series = frame[column]
+        numeric, unit = self._convert_series_to_numeric(series)
+        data[column] = numeric
+        if unit is not None:
+          units[column] = unit
+      self._polars_tables[ptype] = pl.DataFrame(data)
+      self._polars_units[ptype] = units
+    table = self._polars_tables[ptype]
+    return table if mutable else table.clone()
+
+  def set_ptype_from_polars(self, ptype: str, table: "pl.DataFrame") -> None:
+    if not self.use_polars:
+      raise RuntimeError('Polars tables requested but Polars mode is disabled.')
+    if ptype not in c.ptypes.keys():
+      raise KeyError(f'Unknown particle type: {ptype}')
+    pdf = table.to_pandas()
+    if 'pid' in pdf.columns:
+      pdf.set_index('pid', inplace=True)
+    units = self._polars_units.get(ptype, {})
+    for column, unit in units.items():
+      if column in pdf.columns:
+        pdf[column] = unyt.unyt_array(pdf[column].to_numpy(), unit, registry=self.units.registry)
+    object.__setattr__(self, ptype, pdf)
+    self._polars_tables[ptype] = table
 
   def to_polars(self) -> Dict[str, "pl.DataFrame"]:
     if not self.use_polars:

@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import unyt
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict
 if TYPE_CHECKING:
   from octavian.data_manager import DataManager
 
@@ -57,6 +57,7 @@ def wrap_positions(data_manager: DataManager) -> None:
     raise RuntimeError('Polars requested for wrap_positions but Polars is unavailable.')
 
   halos_to_wrap = {direction: set() for direction in ['x', 'y', 'z']}
+  cached_positions: Dict[str, Dict[str, np.ndarray]] = {}
 
   for ptype in ['gas', 'dm', 'star', 'bh']:
     data_manager.load_property('pos', ptype)
@@ -68,10 +69,12 @@ def wrap_positions(data_manager: DataManager) -> None:
     if halo_ids.size == 0:
       continue
 
-    pos_columns = {}
+    pos_columns: Dict[str, np.ndarray] = {}
     for direction in ['x', 'y', 'z']:
       series = frame[direction]
       pos_columns[direction] = _ensure_position_units(series, position_unit, registry).to_value(position_unit)
+
+    cached_positions[ptype] = pos_columns
 
     local = pd.DataFrame(pos_columns)
     local['HaloID'] = halo_ids
@@ -90,18 +93,26 @@ def wrap_positions(data_manager: DataManager) -> None:
     halo_ids = frame['HaloID'].to_numpy()
     if halo_ids.size == 0:
       continue
+    positions = cached_positions.get(ptype)
+    if positions is None:
+      continue
+
     for direction in ['x', 'y', 'z']:
       if not halos_to_wrap[direction]:
         continue
       in_halos = np.isin(halo_ids, list(halos_to_wrap[direction]))
       if not in_halos.any():
         continue
-      coords = _ensure_position_units(frame[direction], position_unit, registry).to_value(position_unit)
+      coords = positions[direction]
       mask = in_halos & (coords > half_box)
       if mask.any():
-        frame.loc[mask, direction] = coords[mask] - boxsize
+        coords = coords.copy()
+        coords[mask] -= boxsize
+        positions[direction] = coords
+
+    for direction in ['x', 'y', 'z']:
+      frame.loc[:, direction] = unyt.unyt_array(positions[direction], position_unit, registry=registry)
 
   if use_polars and HAS_POLARS:
     for ptype in ['gas', 'dm', 'star', 'bh']:
-      table = pl.from_pandas(data_manager[ptype].reset_index().rename(columns={'index': 'pid'}))
-      data_manager._polars_tables[ptype] = table
+      data_manager._invalidate_polars(ptype)

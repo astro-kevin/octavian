@@ -52,6 +52,11 @@ class OCTAVIAN:
       total_steps = 6
 
     step = 1
+    if self.use_polars:
+      print('Polars backend enabled for pipeline.', flush=True)
+    else:
+      print('Using pandas backend for pipeline.', flush=True)
+
     self._log_step(step, total_steps, 'Initialising data manager...')
     t1 = perf_counter()
     data_manager = DataManager(self.dataset, mode=self.mode, use_polars=self.use_polars)

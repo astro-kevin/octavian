@@ -591,8 +591,8 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
           f"(node={node_id}, host={host_id}). Sample PIDs: {missing_pid_sample.tolist()}"
         )
       if valid.size:
-    if use_polars:
-      updates[ptype]['pid'].extend(valid.tolist())
+        if use_polars:
+          updates[ptype]['pid'].extend(valid.tolist())
           updates[ptype]['GalID'].extend([gid] * valid.size)
           updates[ptype]['HaloID'].extend([host_id] * valid.size)
         else:

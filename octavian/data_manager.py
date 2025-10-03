@@ -262,13 +262,30 @@ class DataManager:
     if isinstance(values, unyt.unyt_array):
       unit = values.units
       return values.to_value(unit), unit
-    first = series.iloc[0]
-    if isinstance(first, unyt.unyt_quantity):
-      unit = first.units
-      return np.array([val.to_value(unit) for val in series], dtype=np.float64), unit
-    if hasattr(first, 'to_value') and hasattr(first, 'units'):
-      unit = first.units
-      return np.array([val.to_value(unit) for val in series], dtype=np.float64), unit
+    first_valid = None
+    for val in series:
+      if isinstance(val, unyt.unyt_quantity) or isinstance(val, unyt.unyt_array) or (hasattr(val, 'to_value') and hasattr(val, 'units')):
+        first_valid = val
+        break
+    if first_valid is not None:
+      unit = getattr(first_valid, 'units', None)
+      if unit is None and isinstance(first_valid, unyt.unyt_array):
+        unit = first_valid.units
+
+      def _to_value(val):
+        if isinstance(val, (unyt.unyt_quantity, unyt.unyt_array)):
+          return val.to_value(unit)
+        if hasattr(val, 'to_value'):
+          try:
+            return val.to_value(unit)
+          except Exception:
+            pass
+        if val is None:
+          return np.nan
+        return float(val)
+
+      numeric = np.array([_to_value(val) for val in series], dtype=np.float64)
+      return numeric, unit
     return series.to_numpy(), None
 
   def get_polars_table(self, ptype: str, *, include_index: bool = True, mutable: bool = False) -> "pl.DataFrame":

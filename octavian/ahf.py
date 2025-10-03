@@ -571,7 +571,7 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
     index_lookup: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
     for ptype in c.ptypes.keys():
       table = manager.get_polars_table(ptype)
-      pid_values = table.select('pid').to_series().to_numpy(dtype=np.int64)
+      pid_values = table.select('pid').to_series().to_numpy().astype(np.int64, copy=False)
       order = np.argsort(pid_values)
       sorted_pids = pid_values[order]
       index_lookup[ptype] = (sorted_pids, sorted_pids)

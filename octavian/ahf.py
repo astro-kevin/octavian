@@ -571,7 +571,13 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
     index_lookup: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
     for ptype in c.ptypes.keys():
       table = manager.get_polars_table(ptype)
-      pid_values = table.select('pid').to_series().to_numpy().astype(np.int64, copy=False)
+      pid_values = table.select('pid').to_series().to_numpy()
+      if np.issubdtype(pid_values.dtype, np.floating):
+        if not np.isfinite(pid_values).all():
+          raise ValueError(f"Polars table for {ptype} contains non-finite pid values")
+        pid_values = pid_values.astype(np.int64)
+      else:
+        pid_values = pid_values.astype(np.int64, copy=False)
       order = np.argsort(pid_values)
       sorted_pids = pid_values[order]
       index_lookup[ptype] = (sorted_pids, sorted_pids)
@@ -604,7 +610,7 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
         )
       if valid.size:
         if use_polars:
-          updates[ptype]['pid'].extend(valid.tolist())
+          updates[ptype]['pid'].extend(int(v) for v in valid.tolist())
           updates[ptype]['GalID'].extend([gid] * valid.size)
           updates[ptype]['HaloID'].extend([host_id] * valid.size)
         else:
@@ -623,7 +629,7 @@ def build_galaxies_from_fast(manager: 'DataManager', catalog: AHFCatalog, min_st
         )
       if valid_dm.size:
         if use_polars:
-          updates['dm']['pid'].extend(valid_dm.tolist())
+          updates['dm']['pid'].extend(int(v) for v in valid_dm.tolist())
           updates['dm']['GalID'].extend([gid] * valid_dm.size)
           updates['dm']['HaloID'].extend([host_id] * valid_dm.size)
         else:

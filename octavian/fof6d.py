@@ -189,9 +189,18 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
   fof_filter = lambda halo: len(halo) >= c.MINIMUM_STARS_PER_GALAXY
 
   if use_polars:
-    star_table = data_manager.get_polars_table('star')
-    gas_table = data_manager.get_polars_table('gas')
-    bh_table = data_manager.get_polars_table('bh')
+    def _ensure_polars_table(table):
+      if HAS_POLARS and isinstance(table, pl.DataFrame):
+        return table
+      if HAS_POLARS and isinstance(table, pd.DataFrame):
+        if 'pid' not in table.columns:
+          table = table.reset_index().rename(columns={'index': 'pid'})
+        return pl.from_pandas(table)
+      raise TypeError('Polars backend requested but table is not a Polars DataFrame and conversion is unavailable.')
+
+    star_table = _ensure_polars_table(data_manager.get_polars_table('star'))
+    gas_table = _ensure_polars_table(data_manager.get_polars_table('gas'))
+    bh_table = _ensure_polars_table(data_manager.get_polars_table('bh'))
 
     star_counts = star_table.groupby('HaloID').agg(pl.count().alias('count'))
     valid_haloids = (

@@ -849,7 +849,23 @@ def calculate_group_properties_polars(data_manager: DataManager, include_global:
   for ptype in ['gas', 'dm', 'star', 'bh']:
     data_manager.load_property('pot', ptype)
 
-  polars_tables = {ptype: data_manager.get_polars_table(ptype) for ptype in c.ptypes.keys()}
+  required_cols = ['pid', 'HaloID', 'GalID', 'ptype', 'mass', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'potential']
+  int_cols = {'pid', 'HaloID', 'GalID', 'ptype'}
+
+  polars_tables = {}
+  for ptype in c.ptypes.keys():
+    table = data_manager.get_polars_table(ptype)
+    table = table if isinstance(table, pl.DataFrame) else pl.DataFrame(table)
+    missing = [col for col in required_cols if col not in table.columns]
+    if missing:
+      additions = []
+      for col in missing:
+        if col in int_cols:
+          additions.append(pl.lit(-1).cast(pl.Int64).alias(col))
+        else:
+          additions.append(pl.lit(0.0).cast(pl.Float64).alias(col))
+      table = table.with_columns(additions)
+    polars_tables[ptype] = table.select(required_cols)
   simulation = data_manager.simulation
 
   halos_pl = data_manager.get_collection_polars('halos')

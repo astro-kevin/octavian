@@ -208,13 +208,15 @@ class DataManager:
 
         order = np.argsort(pid_values)
         sorted_values = pid_values[order]
+        dataset_dtype = sorted_values.dtype
 
         worker_count = max(1, self._map_threads)
         chunk_size = max(1, int(np.ceil(ids_unique.size / worker_count)))
 
         def _locate(chunk: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-          pos = np.searchsorted(sorted_values, chunk)
-          valid = (pos < sorted_values.size) & (sorted_values[pos] == chunk)
+          cast_chunk = chunk.astype(dataset_dtype, copy=False)
+          pos = np.searchsorted(sorted_values, cast_chunk)
+          valid = (pos < sorted_values.size) & (sorted_values[pos] == cast_chunk)
           found = order[pos[valid]] if valid.any() else np.array([], dtype=np.int64)
           missing = chunk[~valid]
           return found, missing
@@ -241,10 +243,7 @@ class DataManager:
           missing_ids = np.concatenate(missing_list) if missing_list else np.array([], dtype=np.int64)
 
         if missing_ids.size:
-          print(
-            f"  Warning: missing {missing_ids.size} {ptype} particle IDs (sample: {missing_ids[:10].tolist()})",
-            flush=True,
-          )
+          raise ValueError(f"Missing particle IDs for {ptype}: {missing_ids[:10].tolist()} ...")
 
         index_map[ptype] = np.unique(positions.astype(np.int64, copy=False))
 

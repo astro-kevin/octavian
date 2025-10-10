@@ -241,9 +241,12 @@ class DataManager:
           missing_ids = np.concatenate(missing_list) if missing_list else np.array([], dtype=np.int64)
 
         if missing_ids.size:
-          raise ValueError(f"Missing particle IDs for {ptype}: {missing_ids[:10].tolist()} ...")
+          print(
+            f"  Warning: missing {missing_ids.size} {ptype} particle IDs (sample: {missing_ids[:10].tolist()})",
+            flush=True,
+          )
 
-        index_map[ptype] = positions.astype(np.int64, copy=False)
+        index_map[ptype] = np.unique(positions.astype(np.int64, copy=False))
 
     return index_map
 

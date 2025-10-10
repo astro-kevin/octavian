@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Tuple
 
 import pandas as pd
+import numpy as np
 
 import octavian.constants as c
 from octavian.ahf import load_catalog, apply_ahf_matching
@@ -72,10 +73,10 @@ def run_core(config: CoreInputs) -> CoreResult:  # pragma: no cover - placeholde
   if config.mode != "ahf":
     raise NotImplementedError("Core execution currently supports AHF mode only")
 
-  catalog = load_catalog(str(config.ahf_particles))
+  catalog = load_catalog(str(config.ahf_particles), host_filter=config.host_ids)
 
-  particle_ids: Dict[str, List[int]] = {ptype: [] for ptype in c.ptypes.keys()}
-  seen: Dict[str, set[int]] = {ptype: set() for ptype in c.ptypes.keys()}
+  pid_chunks: Dict[str, List[np.ndarray]] = {ptype: [] for ptype in c.ptypes.keys()}
+  print(f"Processing {len(config.host_ids)} top-level host(s)...", flush=True)
   for host_id in config.host_ids:
     for node in catalog.iter_subtree(int(host_id)):
       particles = catalog.particles.get(int(node))
@@ -85,11 +86,16 @@ def run_core(config: CoreInputs) -> CoreResult:  # pragma: no cover - placeholde
         entries = particles.get(ptype)
         if entries is None or entries.size == 0:
           continue
-        bucket = seen[ptype]
-        for pid in entries.tolist():
-          if pid not in bucket:
-            bucket.add(pid)
-            particle_ids[ptype].append(pid)
+        pid_chunks[ptype].append(entries.astype(np.int64, copy=False))
+
+  particle_ids: Dict[str, np.ndarray] = {}
+  for ptype, arrays in pid_chunks.items():
+    if not arrays:
+      particle_ids[ptype] = np.array([], dtype=np.int64)
+      continue
+    combined = np.unique(np.concatenate(arrays))
+    particle_ids[ptype] = combined
+    print(f"  {ptype}: {combined.size} unique particles", flush=True)
 
   manager = DataManager(
     str(config.snapshot_path),
@@ -97,13 +103,22 @@ def run_core(config: CoreInputs) -> CoreResult:  # pragma: no cover - placeholde
     use_polars=config.use_polars,
     particle_ids=particle_ids,
     include_unassigned=True,
+    map_threads=config.n_threads,
   )
 
+  halo_map = {}
+  missing = {}
+
+  print("Stage 1/4: Wrapping positions...", flush=True)
   wrap_positions(manager)
+
+  print("Stage 2/4: Running FoF6D...", flush=True)
   run_fof6d(manager, nproc=config.n_threads)
 
+  print("Stage 3/4: Matching AHF halos...", flush=True)
   halo_map, missing = apply_ahf_matching(manager, catalog, n_jobs=config.n_threads)
 
+  print("Stage 4/4: Computing group properties...", flush=True)
   calculate_group_properties(
     manager,
     use_polars=getattr(manager, "use_polars", False),

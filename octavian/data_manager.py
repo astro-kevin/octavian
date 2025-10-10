@@ -4,7 +4,7 @@ import h5py
 import unyt
 from astropy.cosmology import FlatLambdaCDM
 from sympy import sympify
-from typing import Optional, Sequence, Dict, Any, Iterable, List
+from typing import Optional, Sequence, Dict, Any, Iterable, List, Tuple
 
 try:
   import polars as pl  # type: ignore
@@ -26,6 +26,7 @@ class DataManager:
     use_polars: Optional[bool] = None,
     particle_indices: Optional[Dict[str, Iterable[int]]] = None,
     particle_ids: Optional[Dict[str, Iterable[int]]] = None,
+    map_threads: Optional[int] = None,
   ):
     self.snapfile = snapfile
     self.mode = mode.lower()
@@ -41,6 +42,7 @@ class DataManager:
     self._polars_tables: Dict[str, "pl.DataFrame"] = {}
     self._polars_units: Dict[str, Dict[str, unyt.Unit]] = {}
     self._particle_indices: Dict[str, np.ndarray] = {}
+    self._map_threads = max(1, int(map_threads)) if map_threads else 1
     if particle_indices:
       for ptype, values in particle_indices.items():
         arr = np.fromiter((int(v) for v in values), dtype=np.int64)
@@ -171,40 +173,74 @@ class DataManager:
     index_map: Dict[str, np.ndarray] = {}
     with h5py.File(self.snapfile) as f:
       for ptype, ids in particle_ids.items():
-        ids_array = np.fromiter((int(pid) for pid in ids), dtype=np.int64)
+        ids_array = np.asarray(ids, dtype=np.int64)
         if ids_array.size == 0:
           index_map[ptype] = np.array([], dtype=np.int64)
           continue
 
         dataset = f[c.ptypes[ptype]][c.prop_aliases['pid']]
-        ids_unique = np.unique(ids_array).astype(dataset.dtype, copy=False)
+        ids_unique = np.unique(ids_array).astype(np.int64, copy=False)
 
-        matches: List[np.ndarray] = []
-        remaining = ids_unique
-        chunk = max(1, min(1_000_000, dataset.shape[0]))
-        for start in range(0, dataset.shape[0], chunk):
-          block = dataset[start:start + chunk]
-          if block.size == 0:
-            break
+        print(
+          f"  Mapping {ptype}: {ids_unique.size} particle IDs across {dataset.shape[0]} snapshot rows",
+          flush=True,
+        )
 
-          mask = np.isin(block, remaining, assume_unique=True)
-          if mask.any():
-            block_indices = np.flatnonzero(mask) + start
-            matches.append(block_indices)
-            found = block[mask]
-            remaining = remaining[~np.isin(remaining, found, assume_unique=True)]
-            if remaining.size == 0:
-              break
-
-        if remaining.size != 0:
-          raise ValueError(f"Missing particle IDs for {ptype}: {remaining[:10].tolist()} ...")
-
-        if matches:
-          index_map[ptype] = np.unique(np.concatenate(matches))
-        else:
+        pid_values = dataset[:]
+        if pid_values.size == 0:
           index_map[ptype] = np.array([], dtype=np.int64)
+          continue
+
+        worker_count = max(1, self._map_threads)
+        chunk_size = max(1, int(np.ceil(ids_unique.size / worker_count)))
+
+        def _locate(chunk: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+          pos = np.searchsorted(pid_values, chunk)
+          valid = (pos < pid_values.size) & (pid_values[pos] == chunk)
+          return pos[valid], chunk[~valid]
+
+        if worker_count == 1 or ids_unique.size < 2 * chunk_size:
+          positions, missing_ids = _locate(ids_unique)
+        else:
+          from concurrent.futures import ThreadPoolExecutor
+
+          positions_list: List[np.ndarray] = []
+          missing_list: List[np.ndarray] = []
+          with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            futures = []
+            for start in range(0, ids_unique.size, chunk_size):
+              chunk = ids_unique[start:start + chunk_size]
+              futures.append(pool.submit(_locate, chunk))
+            for fut in futures:
+              pos, missing_chunk = fut.result()
+              if pos.size:
+                positions_list.append(pos)
+              if missing_chunk.size:
+                missing_list.append(missing_chunk)
+          positions = np.concatenate(positions_list) if positions_list else np.array([], dtype=np.int64)
+          missing_ids = np.concatenate(missing_list) if missing_list else np.array([], dtype=np.int64)
+
+        if missing_ids.size:
+          raise ValueError(f"Missing particle IDs for {ptype}: {missing_ids[:10].tolist()} ...")
+
+        index_map[ptype] = positions.astype(np.int64, copy=False)
 
     return index_map
+
+  @staticmethod
+  def _fetch_dataset(dataset: h5py.Dataset, indices: np.ndarray) -> np.ndarray:
+    if indices.size == 0:
+      shape = (0,) + dataset.shape[1:]
+      return np.empty(shape, dtype=dataset.dtype)
+
+    order = np.argsort(indices)
+    sorted_idx = indices[order]
+    values = dataset[sorted_idx]
+    if not np.all(order == np.arange(order.size)):
+      inverse = np.empty_like(order)
+      inverse[order] = np.arange(order.size)
+      values = values[inverse]
+    return values
 
   def ensure_membership_columns(self) -> None:
     for ptype in c.ptypes.keys():
@@ -275,10 +311,7 @@ class DataManager:
         indexer = self[ptype].index.to_numpy(dtype=np.int64, copy=False)
         factor = self.get_unit_conversion_factor('mass')
 
-        if len(indexer) == 0:
-          masses = np.array([], dtype=float)
-        else:
-          masses = masses_dset[indexer] * factor
+        masses = self._fetch_dataset(masses_dset, indexer) * factor
 
         self[ptype]['mass'] = masses
 
@@ -347,8 +380,8 @@ class DataManager:
     with h5py.File(self.snapfile) as f:
       dataset = f[ptype][prop]
       indexer = self[requested_ptype].index.to_numpy(dtype=np.int64, copy=False)
-      has_data = len(indexer) != 0
-      values = dataset[indexer] if has_data else None
+      values = self._fetch_dataset(dataset, indexer)
+      has_data = values.size != 0
 
       if isinstance(column, list):
         factor = self.get_unit_conversion_factor(requested_prop)

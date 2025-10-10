@@ -123,67 +123,89 @@ def _map_pid_array(pid_array: np.ndarray, values: np.ndarray, indices: np.ndarra
   return matched_indices, missing
 
 
-def read_ahf_particles(path: Path) -> Tuple[Dict[int, Dict[str, np.ndarray]], Dict[int, np.ndarray]]:
-  """Parse an ``AHF_particles`` catalogue."""
-  return _read_ahf_particles_stream(path)
+def read_ahf_particles(path: Path, selected_nodes: Optional[Set[int]] = None) -> Tuple[Dict[int, Dict[str, np.ndarray]], Dict[int, np.ndarray]]:
+  """Parse an ``AHF_particles`` catalogue.
+
+  When ``selected_nodes`` is provided, only the memberships/star owners for the
+  requested halo IDs are materialised. The reader stops once all selected nodes
+  have been encountered.
+  """
+  return _read_ahf_particles_stream(path, selected_nodes=selected_nodes)
 
 
-def _read_ahf_particles_stream(path: Path) -> Tuple[Dict[int, Dict[str, np.ndarray]], Dict[int, np.ndarray]]:
+def _read_ahf_particles_stream(path: Path, selected_nodes: Optional[Set[int]] = None) -> Tuple[Dict[int, Dict[str, np.ndarray]], Dict[int, np.ndarray]]:
   memberships: Dict[int, Dict[str, Set[int]]] = {}
   star_owner: Dict[int, Set[int]] = {}
+  target_nodes: Optional[Set[int]] = set(selected_nodes) if selected_nodes is not None else None
+  pending_nodes: Optional[Set[int]] = set(target_nodes) if target_nodes is not None else None
 
   with _open_catalog(path) as fh:
-    current_hid: Optional[int] = None
-    remaining = 0
-    for raw in fh:
-      line = raw.strip()
-      if not line:
-        continue
-      parts = line.split()
-      if remaining == 0:
-        if len(parts) != 2:
-          if len(parts) == 1:
-            # MPI separation marker; skip without affecting state
-            continue
-          continue
-        try:
-          remaining = int(parts[0])
-          current_hid = int(parts[1])
-        except ValueError:
-          current_hid = None
-          remaining = 0
-          continue
-        memberships.setdefault(current_hid, {})
-        continue
+    lines = fh.readlines()
 
-      if current_hid is None or len(parts) != 2:
+  current_hid: Optional[int] = None
+  remaining = 0
+  store_current = False
+
+  for raw in lines:
+    line = raw.strip()
+    if not line:
+      continue
+    parts = line.split()
+    if remaining == 0:
+      if len(parts) != 2:
         if len(parts) == 1:
-          # MPI separation marker inside member list; ignore and do not
-          # decrement remaining so the next line is still processed.
+          # MPI separation marker; skip without affecting state
           continue
-        remaining -= 1
         continue
-
       try:
-        pid = int(parts[0])
-        ptype = int(parts[1])
+        remaining = int(parts[0])
+        current_hid = int(parts[1])
       except ValueError:
-        remaining -= 1
+        current_hid = None
+        remaining = 0
         continue
+      store_current = (target_nodes is None) or (current_hid in target_nodes)
+      if store_current:
+        memberships.setdefault(current_hid, {})
+      continue
 
-      name = _PTYPE_NAME.get(ptype)
-      if name is None:
-        remaining -= 1
+    if current_hid is None or len(parts) != 2:
+      if len(parts) == 1:
+        # MPI separation marker inside member list; ignore and do not
+        # decrement remaining so the next line is still processed.
         continue
+      remaining -= 1
+      continue
 
+    try:
+      pid = int(parts[0])
+      ptype = int(parts[1])
+    except ValueError:
+      remaining -= 1
+      continue
+
+    name = _PTYPE_NAME.get(ptype)
+    if name is None:
+      remaining -= 1
+      continue
+
+    if store_current:
       pdata = memberships.setdefault(current_hid, {})
       pdata.setdefault(name, set()).add(pid)
       if name == "star":
         star_owner.setdefault(pid, set()).add(current_hid)
 
-      remaining -= 1
-      if remaining == 0:
-        current_hid = None
+    remaining -= 1
+    if remaining == 0:
+      finished_hid = current_hid
+      current_hid = None
+      if store_current and pending_nodes is not None and finished_hid is not None:
+        pending_nodes.discard(finished_hid)
+        if not pending_nodes:
+          break
+      store_current = False
+
+  del lines
 
   _normalise_memberships(memberships)
   for pid, owners in list(star_owner.items()):
@@ -422,11 +444,25 @@ class AHFCatalog:
     return payloads
 
 
-def load_catalog(particles_path: str, halos_path: Optional[str] = None) -> AHFCatalog:
+def load_catalog(particles_path: str, halos_path: Optional[str] = None, host_filter: Optional[Iterable[int]] = None) -> AHFCatalog:
   particles_file = Path(particles_path)
   halos_file = Path(halos_path) if halos_path is not None else None
-  memberships, star_owner = read_ahf_particles(particles_file)
   parent_of, children_of = read_ahf_hierarchy(particles_file, halos_file)
+
+  selected_nodes: Optional[Set[int]] = None
+  if host_filter is not None:
+    selected_nodes = set()
+    roots = [int(h) for h in host_filter]
+    stack = roots[:]
+    while stack:
+      node = stack.pop()
+      if node in selected_nodes:
+        continue
+      selected_nodes.add(node)
+      stack.extend(children_of.get(node, []))
+    print(f"Restricting AHF catalogue to {len(selected_nodes)} node(s) derived from host filter.", flush=True)
+
+  memberships, star_owner = read_ahf_particles(particles_file, selected_nodes=selected_nodes)
   return AHFCatalog(
     particles=memberships,
     star_owner=star_owner,

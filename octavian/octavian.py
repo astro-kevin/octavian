@@ -59,7 +59,12 @@ class OCTAVIAN:
 
     self._log_step(step, total_steps, 'Initialising data manager...')
     t1 = perf_counter()
-    data_manager = DataManager(self.dataset, mode=self.mode, use_polars=self.use_polars)
+    data_manager = DataManager(
+      self.dataset,
+      mode=self.mode,
+      use_polars=self.use_polars,
+      map_threads=self.nproc,
+    )
     self._log_duration(t1)
     step += 1
 

@@ -41,6 +41,8 @@ class DataManager:
       self.use_polars = bool(use_polars)
     self._polars_tables: Dict[str, "pl.DataFrame"] = {}
     self._polars_units: Dict[str, Dict[str, unyt.Unit]] = {}
+    self._halos_polars: Optional["pl.DataFrame"] = None
+    self._galaxies_polars: Optional["pl.DataFrame"] = None
     self._particle_indices: Dict[str, np.ndarray] = {}
     self._map_threads = max(1, int(map_threads)) if map_threads else 1
     if particle_indices:
@@ -76,8 +78,15 @@ class DataManager:
     if self.mode in ('fof', 'ahf'):
       self.halos = pd.DataFrame(index=self.haloIDs)
       self.load_halo_pids()
+      if self.use_polars and HAS_POLARS:
+        self._halos_polars = pl.DataFrame({'HaloID': self.halos.index.to_numpy(dtype=np.int64, copy=False)})
     else:
       self.halos = pd.DataFrame()
+
+    if self.use_polars and HAS_POLARS and not self.halos.empty:
+      halos_pd = self.halos.reset_index()
+      halos_pd.rename(columns={'index': 'HaloID'}, inplace=True)
+      self._halos_polars = pl.from_pandas(halos_pd)
 
   # programmatic access to attrs based on https://peps.python.org/pep-0363/
   def __getitem__(self, name):
@@ -85,8 +94,14 @@ class DataManager:
   
   def __setitem__(self, name, value):
     setattr(self, name, value)
-    if self.use_polars and isinstance(name, str) and name in c.ptypes.keys():
+    if not self.use_polars:
+      return
+    if isinstance(name, str) and name in c.ptypes.keys():
       self._invalidate_polars(name)
+    elif name == 'halos':
+      self._invalidate_collection_polars('halos')
+    elif name == 'galaxies':
+      self._invalidate_collection_polars('galaxies')
   
   def __delitem__(self, name):
     return delattr(self, name)
@@ -287,6 +302,7 @@ class DataManager:
 
     for plist in c.ptype_lists.values():
       self.halos[plist] = self.halos.get(plist, pd.Series(dtype=object)).fillna({i: [] for i in self.halos.index})
+    self._invalidate_collection_polars('halos')
 
   def load_galaxy_pids(self) -> None:
     for ptype in c.ptypes.keys():
@@ -302,6 +318,7 @@ class DataManager:
     for plist in c.ptype_lists.values():
       if plist in self.galaxies:
         self.galaxies[plist] = self.galaxies[plist].fillna({i: [] for i in self.galaxies.index})
+    self._invalidate_collection_polars('galaxies')
 
   def load_masses(self):
     with h5py.File(self.snapfile) as f:
@@ -440,6 +457,58 @@ class DataManager:
     elif ptype in self._polars_tables:
       self._polars_tables.pop(ptype, None)
       self._polars_units.pop(ptype, None)
+
+  def _invalidate_collection_polars(self, collection: str) -> None:
+    if not self.use_polars or not HAS_POLARS:
+      return
+    if collection == 'halos':
+      self._halos_polars = None
+    elif collection == 'galaxies':
+      self._galaxies_polars = None
+
+  def get_collection_polars(self, collection: str) -> "pl.DataFrame":
+    if not self.use_polars or not HAS_POLARS:
+      raise RuntimeError('Polars collections requested but Polars mode is disabled.')
+    if collection == 'halos':
+      if self._halos_polars is None:
+        halos_pd = self['halos'].reset_index()
+        first_col = halos_pd.columns[0]
+        if first_col != 'HaloID':
+          halos_pd.rename(columns={first_col: 'HaloID'}, inplace=True)
+        self._halos_polars = pl.from_pandas(halos_pd)
+      return self._halos_polars.clone()
+    if collection == 'galaxies':
+      if self._galaxies_polars is None:
+        galaxies_pd = self['galaxies'].reset_index()
+        first_col = galaxies_pd.columns[0]
+        if first_col != 'GalID':
+          galaxies_pd.rename(columns={first_col: 'GalID'}, inplace=True)
+        self._galaxies_polars = pl.from_pandas(galaxies_pd)
+      return self._galaxies_polars.clone()
+    raise KeyError(f'Unknown collection: {collection}')
+
+  def set_collection_polars(self, collection: str, table: "pl.DataFrame") -> None:
+    if not self.use_polars or not HAS_POLARS:
+      raise RuntimeError('Polars collections requested but Polars mode is disabled.')
+    if collection == 'halos':
+      self._halos_polars = table
+      halos_pd = table.to_pandas()
+      if 'HaloID' in halos_pd.columns:
+        halos_pd.set_index('HaloID', inplace=True)
+      else:
+        halos_pd.index.name = 'HaloID'
+      self.halos = halos_pd
+      return
+    if collection == 'galaxies':
+      self._galaxies_polars = table
+      galaxies_pd = table.to_pandas()
+      if 'GalID' in galaxies_pd.columns:
+        galaxies_pd.set_index('GalID', inplace=True)
+      else:
+        galaxies_pd.index.name = 'GalID'
+      self.galaxies = galaxies_pd
+      return
+    raise KeyError(f'Unknown collection: {collection}')
 
   def _convert_series_to_numeric(self, series: pd.Series) -> tuple[np.ndarray, Optional[unyt.Unit]]:
     if series.empty:

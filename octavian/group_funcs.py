@@ -496,6 +496,41 @@ def _apply_angular_threshold(collection_data: pd.DataFrame, group_name: str) -> 
   collection_data.loc[mask, existing] = 0.
 
 
+def _apply_angular_threshold_polars(collection_data, group_name: str):
+  angular_cols = [
+    f'velocity_dispersion_{group_name}',
+    f'Lx_{group_name}', f'Ly_{group_name}', f'Lz_{group_name}',
+    f'L_{group_name}', f'BoverT_{group_name}', f'kappa_rot_{group_name}',
+    f'ALPHA_{group_name}', f'BETA_{group_name}'
+  ]
+  existing = [col for col in angular_cols if col in collection_data.columns]
+  if not existing:
+    return collection_data
+  threshold = pl.col(f'n{group_name}') < 3
+  updates = [
+    pl.when(threshold).then(pl.lit(0.0)).otherwise(pl.col(col)).alias(col)
+    for col in existing
+  ]
+  return collection_data.with_columns(updates)
+
+
+def _polars_to_pandas_collection(table, index_col: str) -> pd.DataFrame:
+  pdf = table.to_pandas()
+  if index_col in pdf.columns:
+    pdf.set_index(index_col, inplace=True)
+  else:
+    pdf.index.name = index_col
+  return pdf
+
+
+def _pandas_to_polars_collection(frame: pd.DataFrame, index_col: str) -> "pl.DataFrame":
+  reset = frame.reset_index()
+  first_col = reset.columns[0]
+  if first_col != index_col:
+    reset.rename(columns={first_col: index_col}, inplace=True)
+  return pl.from_pandas(reset)
+
+
 def _prepare_polars_gas_table(gas_df, data_manager: DataManager):
   if gas_df.is_empty():
     data_manager['gas']['mass_HI'] = 0.
@@ -639,7 +674,7 @@ def _polars_bh(df, groupID: str) -> pl.DataFrame:
   return agg
 
 
-def calculate_group_properties_polars(data_manager: DataManager, include_global: bool = True) -> None:
+def _calculate_group_properties_polars_legacy(data_manager: DataManager, include_global: bool = True) -> None:
   if not HAS_POLARS:
     raise RuntimeError('Polars is not available but Polars execution was requested.')
 
@@ -805,6 +840,147 @@ def calculate_group_properties_polars(data_manager: DataManager, include_global:
   data_manager['halos'] = halos_df.copy()
   data_manager['galaxies'] = galaxies_df.copy()
   progress.close()
+
+
+def calculate_group_properties_polars(data_manager: DataManager, include_global: bool = True) -> None:
+  if not HAS_POLARS:
+    raise RuntimeError('Polars is not available but Polars execution was requested.')
+
+  for ptype in ['gas', 'dm', 'star', 'bh']:
+    data_manager.load_property('pot', ptype)
+
+  polars_tables = {ptype: data_manager.get_polars_table(ptype) for ptype in c.ptypes.keys()}
+  simulation = data_manager.simulation
+
+  halos_pl = data_manager.get_collection_polars('halos')
+  galaxies_pl = data_manager.get_collection_polars('galaxies')
+
+  all_particles = pl.concat([polars_tables[ptype] for ptype in c.ptypes.keys()], how='vertical_relaxed')
+
+  def _join(base: "pl.DataFrame", result: "pl.DataFrame", key: str) -> "pl.DataFrame":
+    return base if result.is_empty() else base.join(result, on=key, how='left')
+
+  halos_pl = _apply_angular_threshold_polars(
+    _join(halos_pl, _polars_common(all_particles, 'HaloID', 'total', True, simulation), 'HaloID'),
+    'total'
+  )
+
+  galaxies_particles = _polars_filter_galaxies(all_particles)
+  galaxies_pl = _apply_angular_threshold_polars(
+    _join(galaxies_pl, _polars_common(galaxies_particles, 'GalID', 'total', False, simulation), 'GalID'),
+    'total'
+  )
+
+  dm_particles = polars_tables['dm']
+  halos_pl = _apply_angular_threshold_polars(
+    _join(halos_pl, _polars_common(dm_particles, 'HaloID', 'dm', False, simulation), 'HaloID'),
+    'dm'
+  )
+  galaxies_pl = _apply_angular_threshold_polars(
+    _join(galaxies_pl, _polars_common(_polars_filter_galaxies(dm_particles), 'GalID', 'dm', False, simulation), 'GalID'),
+    'dm'
+  )
+
+  baryon_particles = pl.concat([polars_tables[ptype] for ptype in ['gas', 'star', 'bh']], how='vertical_relaxed')
+  halos_pl = _apply_angular_threshold_polars(
+    _join(halos_pl, _polars_common(baryon_particles, 'HaloID', 'baryon', False, simulation), 'HaloID'),
+    'baryon'
+  )
+  galaxies_pl = _apply_angular_threshold_polars(
+    _join(galaxies_pl, _polars_common(_polars_filter_galaxies(baryon_particles), 'GalID', 'baryon', False, simulation), 'GalID'),
+    'baryon'
+  )
+
+  gas_particles = polars_tables['gas']
+  halos_pl = _apply_angular_threshold_polars(
+    _join(halos_pl, _polars_common(gas_particles, 'HaloID', 'gas', False, simulation), 'HaloID'),
+    'gas'
+  )
+  galaxies_pl = _apply_angular_threshold_polars(
+    _join(galaxies_pl, _polars_common(_polars_filter_galaxies(gas_particles), 'GalID', 'gas', False, simulation), 'GalID'),
+    'gas'
+  )
+
+  polars_gas_full = _prepare_polars_gas_table(polars_tables['gas'], data_manager)
+  if not polars_gas_full.is_empty():
+    gas_cols = ['HaloID', 'GalID', 'mass', 'rho', 'nh', 'fH2', 'metallicity', 'sfr', 'temperature', 'mass_HI', 'mass_H2', '_metallicity_mass_weighted', '_metallicity_sfr_weighted', '_temp_mass_weighted', '_temp_metal_weighted']
+    halos_pl = _join(halos_pl, _polars_gas_aggregate(polars_gas_full.select(gas_cols), 'HaloID'), 'HaloID')
+    galaxies_pl = _join(galaxies_pl, _polars_gas_aggregate(_polars_filter_galaxies(polars_gas_full.select(gas_cols)), 'GalID'), 'GalID')
+
+  star_particles = polars_tables['star']
+  halos_pl = _apply_angular_threshold_polars(
+    _join(halos_pl, _polars_common(star_particles, 'HaloID', 'star', False, simulation), 'HaloID'),
+    'star'
+  )
+  galaxies_pl = _apply_angular_threshold_polars(
+    _join(galaxies_pl, _polars_common(_polars_filter_galaxies(star_particles), 'GalID', 'star', False, simulation), 'GalID'),
+    'star'
+  )
+  halos_pl = _join(halos_pl, _polars_star(star_particles, 'HaloID'), 'HaloID')
+  galaxies_pl = _join(galaxies_pl, _polars_star(_polars_filter_galaxies(star_particles), 'GalID'), 'GalID')
+
+  bh_particles = polars_tables['bh']
+  halos_pl = _apply_angular_threshold_polars(
+    _join(halos_pl, _polars_common(bh_particles, 'HaloID', 'bh', False, simulation), 'HaloID'),
+    'bh'
+  )
+  galaxies_pl = _apply_angular_threshold_polars(
+    _join(galaxies_pl, _polars_common(_polars_filter_galaxies(bh_particles), 'GalID', 'bh', False, simulation), 'GalID'),
+    'bh'
+  )
+  halos_pl = _join(halos_pl, _polars_bh(bh_particles, 'HaloID'), 'HaloID')
+  galaxies_pl = _join(galaxies_pl, _polars_bh(_polars_filter_galaxies(bh_particles), 'GalID'), 'GalID')
+
+  for ptype in ['dm', 'gas', 'star', 'bh']:
+    drop_cols = [col for col in ['vx', 'vy', 'vz', 'potential'] if col in data_manager[ptype]]
+    if drop_cols:
+      data_manager[ptype] = data_manager[ptype].drop(columns=drop_cols)
+
+  halos_pd = _polars_to_pandas_collection(halos_pl, 'HaloID')
+  galaxies_pd = _polars_to_pandas_collection(galaxies_pl, 'GalID')
+
+  data_manager['halos'] = halos_pd
+  data_manager['galaxies'] = galaxies_pd
+
+  if include_global:
+    aperture_props_columns = ['HaloID', 'GalID', 'ptype', 'mass', 'x', 'y', 'z']
+    data = pd.concat([data_manager[ptype][aperture_props_columns] for ptype in c.ptypes.keys()])
+
+    aperture_HI_columns = ['HaloID', 'GalID', 'ptype', 'mass_HI', 'x', 'y', 'z']
+    HI_gas = data_manager['gas'][aperture_HI_columns].copy()
+    HI_gas.rename(columns={'mass_HI': 'mass'}, inplace=True)
+    HI_gas['ptype'] = 10
+
+    aperture_H2_columns = ['HaloID', 'GalID', 'ptype', 'mass_H2', 'x', 'y', 'z']
+    H2_gas = data_manager['gas'][aperture_H2_columns].copy()
+    H2_gas.rename(columns={'mass_H2': 'mass'}, inplace=True)
+    H2_gas['ptype'] = 11
+
+    data = pd.concat([data, HI_gas, H2_gas], ignore_index=True)
+
+    aperture = 30.
+    galaxy_positions = data_manager['galaxies'][['x_total', 'y_total', 'z_total']].to_numpy()
+
+    process_halo = partial(calculate_aperture_masses, aperture=aperture, galaxy_positions=galaxy_positions)
+    aperture_masses = data.groupby(by='HaloID').apply(process_halo, include_groups=False).reset_index(names=['HaloID', 'GalID'])
+    aperture_masses.set_index('GalID', inplace=True)
+
+    data_manager['galaxies']['mass_gas_30kpc'] = aperture_masses[0]
+    data_manager['galaxies']['mass_dm_30kpc'] = aperture_masses[1]
+    data_manager['galaxies']['mass_star_30kpc'] = aperture_masses[4]
+    data_manager['galaxies']['mass_bh_30kpc'] = aperture_masses[5]
+    data_manager['galaxies']['mass_HI_30kpc'] = aperture_masses[10]
+    data_manager['galaxies']['mass_H2_30kpc'] = aperture_masses[11]
+    data_manager['galaxies']['mass_total_30kpc'] = data_manager['galaxies'][['mass_gas_30kpc', 'mass_dm_30kpc', 'mass_star_30kpc', 'mass_bh_30kpc']].sum(axis=1)
+
+    calculate_local_densities(data_manager)
+
+    halos_pl = data_manager.get_collection_polars('halos')
+    galaxies_pl = data_manager.get_collection_polars('galaxies')
+
+  if data_manager.use_polars and HAS_POLARS:
+    data_manager._halos_polars = halos_pl
+    data_manager._galaxies_polars = galaxies_pl
 
 
 def calculate_group_properties(data_manager: DataManager, use_polars: bool = False, include_global: bool = True) -> None:

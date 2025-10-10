@@ -491,12 +491,12 @@ def apply_ahf_matching(manager: 'DataManager', catalog: AHFCatalog, n_jobs: int 
   galaxy_star_sets: Dict[int, np.ndarray] = {}
   if use_polars:
     star_table = manager.get_polars_table('star')
-    galaxy_groups_pl = (
-      star_table
-      .filter(pl.col('GalID') != -1)
-      .groupby('GalID')
-      .agg(pl.col('pid').unique().alias('pid_list'))
-    )
+    star_table = star_table if isinstance(star_table, pl.DataFrame) else pl.DataFrame(star_table)
+    filtered = star_table.filter(pl.col('GalID') != -1)
+    group_method = getattr(filtered, 'groupby', None) or getattr(filtered, 'group_by', None)
+    if group_method is None:
+      raise TypeError('Polars DataFrame missing groupby/group_by method')
+    galaxy_groups_pl = group_method('GalID').agg(pl.col('pid').unique().alias('pid_list'))
     for row in galaxy_groups_pl.iter_rows(named=True):
       pid_array = np.array(row['pid_list'], dtype=np.int64)
       galaxy_star_sets[int(row['GalID'])] = np.unique(pid_array)

@@ -212,9 +212,9 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
     gas_table = _ensure_polars_table(data_manager.get_polars_table('gas'))
     bh_table = _ensure_polars_table(data_manager.get_polars_table('bh'))
 
-    star_table = pl.DataFrame(star_table)
-    gas_table = pl.DataFrame(gas_table)
-    bh_table = pl.DataFrame(bh_table)
+    star_table = pl.DataFrame(star_table) if not isinstance(star_table, pl.DataFrame) else star_table
+    gas_table = pl.DataFrame(gas_table) if not isinstance(gas_table, pl.DataFrame) else gas_table
+    bh_table = pl.DataFrame(bh_table) if not isinstance(bh_table, pl.DataFrame) else bh_table
 
     star_counts = star_table.groupby('HaloID').agg(pl.count().alias('count'))
     valid_haloids = (

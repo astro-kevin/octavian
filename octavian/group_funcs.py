@@ -639,7 +639,7 @@ def _polars_bh(df, groupID: str) -> pl.DataFrame:
   return agg
 
 
-def calculate_group_properties_polars(data_manager: DataManager) -> None:
+def calculate_group_properties_polars(data_manager: DataManager, include_global: bool = True) -> None:
   if not HAS_POLARS:
     raise RuntimeError('Polars is not available but Polars execution was requested.')
 
@@ -655,15 +655,16 @@ def calculate_group_properties_polars(data_manager: DataManager) -> None:
 
   polars_tables = {}
   for ptype in c.ptypes.keys():
-    pdf = data_manager[ptype][group_props_columns].copy()
-    polars_tables[ptype] = pl.from_pandas(pdf)
+    table = data_manager.get_polars_table(ptype, include_index=False)
+    polars_tables[ptype] = table.select(group_props_columns)
 
   simulation = data_manager.simulation
 
   halos_df = data_manager['halos'].copy()
   galaxies_df = data_manager['galaxies'].copy()
 
-  all_particles = pl.concat([polars_tables[ptype] for ptype in c.ptypes.keys()], how='vertical_relaxed')
+  dr = pl.concat([polars_tables[ptype] for ptype in c.ptypes.keys()], how='vertical_relaxed')
+  all_particles = dr
 
   halos_common = _polars_common(all_particles, 'HaloID', 'total', True, simulation)
   _assign_polars_result(halos_df, 'HaloID', halos_common)
@@ -763,49 +764,52 @@ def calculate_group_properties_polars(data_manager: DataManager) -> None:
     if drop_cols:
       data_manager[ptype] = data_manager[ptype].drop(columns=drop_cols)
 
-  # Aperture calculations (pandas)
-  aperture_props_columns = ['HaloID', 'GalID', 'ptype', 'mass', 'x',  'y', 'z']
-  data = pd.concat([data_manager[ptype][aperture_props_columns] for ptype in c.ptypes.keys()])
+  if include_global:
+    aperture_props_columns = ['HaloID', 'GalID', 'ptype', 'mass', 'x',  'y', 'z']
+    data = pd.concat([data_manager[ptype][aperture_props_columns] for ptype in c.ptypes.keys()])
 
-  aperture_HI_columns = ['HaloID', 'GalID', 'ptype', 'mass_HI', 'x',  'y', 'z']
-  HI_gas = data_manager['gas'][aperture_HI_columns].copy()
-  HI_gas.rename(columns={'mass_HI': 'mass'}, inplace=True)
-  HI_gas['ptype'] = 10
+    aperture_HI_columns = ['HaloID', 'GalID', 'ptype', 'mass_HI', 'x',  'y', 'z']
+    HI_gas = data_manager['gas'][aperture_HI_columns].copy()
+    HI_gas.rename(columns={'mass_HI': 'mass'}, inplace=True)
+    HI_gas['ptype'] = 10
 
-  aperture_H2_columns = ['HaloID', 'GalID', 'ptype', 'mass_H2', 'x',  'y', 'z']
-  H2_gas = data_manager['gas'][aperture_H2_columns].copy()
-  H2_gas.rename(columns={'mass_H2': 'mass'}, inplace=True)
-  H2_gas['ptype'] = 11
+    aperture_H2_columns = ['HaloID', 'GalID', 'ptype', 'mass_H2', 'x',  'y', 'z']
+    H2_gas = data_manager['gas'][aperture_H2_columns].copy()
+    H2_gas.rename(columns={'mass_H2': 'mass'}, inplace=True)
+    H2_gas['ptype'] = 11
 
-  data = pd.concat([data, HI_gas, H2_gas], ignore_index=True)
+    data = pd.concat([data, HI_gas, H2_gas], ignore_index=True)
 
-  aperture = 30.
-  galaxy_positions = galaxies_df[['x_total', 'y_total', 'z_total']].to_numpy()
+    aperture = 30.
+    galaxy_positions = galaxies_df[['x_total', 'y_total', 'z_total']].to_numpy()
 
-  process_halo = partial(calculate_aperture_masses, aperture=aperture, galaxy_positions=galaxy_positions)
-  aperture_masses = data.groupby(by='HaloID').apply(process_halo, include_groups = False).reset_index(names=['HaloID', 'GalID'])
-  aperture_masses.set_index('GalID', inplace=True)
+    process_halo = partial(calculate_aperture_masses, aperture=aperture, galaxy_positions=galaxy_positions)
+    aperture_masses = data.groupby(by='HaloID').apply(process_halo, include_groups = False).reset_index(names=['HaloID', 'GalID'])
+    aperture_masses.set_index('GalID', inplace=True)
 
-  galaxies_df['mass_gas_30kpc'] = aperture_masses[0]
-  galaxies_df['mass_dm_30kpc'] = aperture_masses[1]
-  galaxies_df['mass_star_30kpc'] = aperture_masses[4]
-  galaxies_df['mass_bh_30kpc'] = aperture_masses[5]
-  galaxies_df['mass_HI_30kpc'] = aperture_masses[10]
-  galaxies_df['mass_H2_30kpc'] = aperture_masses[11]
-  galaxies_df['mass_total_30kpc'] = galaxies_df[['mass_gas_30kpc', 'mass_dm_30kpc', 'mass_star_30kpc', 'mass_bh_30kpc']].sum(axis=1)
+    galaxies_df['mass_gas_30kpc'] = aperture_masses[0]
+    galaxies_df['mass_dm_30kpc'] = aperture_masses[1]
+    galaxies_df['mass_star_30kpc'] = aperture_masses[4]
+    galaxies_df['mass_bh_30kpc'] = aperture_masses[5]
+    galaxies_df['mass_HI_30kpc'] = aperture_masses[10]
+    galaxies_df['mass_H2_30kpc'] = aperture_masses[11]
+    galaxies_df['mass_total_30kpc'] = galaxies_df[['mass_gas_30kpc', 'mass_dm_30kpc', 'mass_star_30kpc', 'mass_bh_30kpc']].sum(axis=1)
 
-  _progress_step(progress, _next_label(labels_iter))
-  calculate_local_densities(data_manager)
-  _progress_step(progress, _next_label(labels_iter))
+    _progress_step(progress, _next_label(labels_iter))
+    calculate_local_densities(data_manager)
+    _progress_step(progress, _next_label(labels_iter))
+  else:
+    _progress_step(progress, _next_label(labels_iter))
+    _progress_step(progress, _next_label(labels_iter))
 
   data_manager['halos'] = halos_df.copy()
   data_manager['galaxies'] = galaxies_df.copy()
   progress.close()
 
 
-def calculate_group_properties(data_manager: DataManager, use_polars: bool = False) -> None:
+def calculate_group_properties(data_manager: DataManager, use_polars: bool = False, include_global: bool = True) -> None:
   if use_polars and HAS_POLARS:
-    calculate_group_properties_polars(data_manager)
+    calculate_group_properties_polars(data_manager, include_global=include_global)
     return
   for ptype in ['gas', 'dm', 'star', 'bh']:
     data_manager.load_property('pot', ptype)
@@ -916,38 +920,41 @@ def calculate_group_properties(data_manager: DataManager, use_polars: bool = Fal
     data_manager[collection] = data_manager[collection].copy()
     _progress_step(progress, _next_label(labels_iter))
 
-  # aperture
-  aperture_props_columns = ['HaloID', 'GalID', 'ptype', 'mass', 'x',  'y', 'z']
-  data = pd.concat([data_manager[ptype][aperture_props_columns] for ptype in c.ptypes.keys()])
+  if include_global:
+    aperture_props_columns = ['HaloID', 'GalID', 'ptype', 'mass', 'x',  'y', 'z']
+    data = pd.concat([data_manager[ptype][aperture_props_columns] for ptype in c.ptypes.keys()])
 
-  aperture_HI_columns = ['HaloID', 'GalID', 'ptype', 'mass_HI', 'x',  'y', 'z']
-  HI_gas = data_manager['gas'][aperture_HI_columns].copy()
-  HI_gas.rename(columns={'mass_HI': 'mass'}, inplace=True)
-  HI_gas['ptype'] = 10
+    aperture_HI_columns = ['HaloID', 'GalID', 'ptype', 'mass_HI', 'x',  'y', 'z']
+    HI_gas = data_manager['gas'][aperture_HI_columns].copy()
+    HI_gas.rename(columns={'mass_HI': 'mass'}, inplace=True)
+    HI_gas['ptype'] = 10
 
-  aperture_H2_columns = ['HaloID', 'GalID', 'ptype', 'mass_H2', 'x',  'y', 'z']
-  H2_gas = data_manager['gas'][aperture_H2_columns].copy()
-  H2_gas.rename(columns={'mass_H2': 'mass'}, inplace=True)
-  H2_gas['ptype'] = 11
+    aperture_H2_columns = ['HaloID', 'GalID', 'ptype', 'mass_H2', 'x',  'y', 'z']
+    H2_gas = data_manager['gas'][aperture_H2_columns].copy()
+    H2_gas.rename(columns={'mass_H2': 'mass'}, inplace=True)
+    H2_gas['ptype'] = 11
 
-  data = pd.concat([data, HI_gas, H2_gas], ignore_index=True)
+    data = pd.concat([data, HI_gas, H2_gas], ignore_index=True)
 
-  aperture = 30.
-  galaxy_positions = data_manager['galaxies'][['x_total', 'y_total', 'z_total']].to_numpy()
+    aperture = 30.
+    galaxy_positions = data_manager['galaxies'][['x_total', 'y_total', 'z_total']].to_numpy()
 
-  process_halo = partial(calculate_aperture_masses, aperture=aperture, galaxy_positions=galaxy_positions)
-  aperture_masses = data.groupby(by='HaloID').apply(process_halo, include_groups = False).reset_index(names=['HaloID', 'GalID'])
-  aperture_masses.set_index('GalID', inplace=True)
+    process_halo = partial(calculate_aperture_masses, aperture=aperture, galaxy_positions=galaxy_positions)
+    aperture_masses = data.groupby(by='HaloID').apply(process_halo, include_groups = False).reset_index(names=['HaloID', 'GalID'])
+    aperture_masses.set_index('GalID', inplace=True)
 
-  data_manager['galaxies']['mass_gas_30kpc'] = aperture_masses[0]
-  data_manager['galaxies']['mass_dm_30kpc'] = aperture_masses[1]
-  data_manager['galaxies']['mass_star_30kpc'] = aperture_masses[4]
-  data_manager['galaxies']['mass_bh_30kpc'] = aperture_masses[5]
-  data_manager['galaxies']['mass_HI_30kpc'] = aperture_masses[10]
-  data_manager['galaxies']['mass_H2_30kpc'] = aperture_masses[11]
-  data_manager['galaxies']['mass_total_30kpc'] = data_manager['galaxies'][['mass_gas_30kpc', 'mass_dm_30kpc', 'mass_star_30kpc', 'mass_bh_30kpc']].sum(axis=1)
+    data_manager['galaxies']['mass_gas_30kpc'] = aperture_masses[0]
+    data_manager['galaxies']['mass_dm_30kpc'] = aperture_masses[1]
+    data_manager['galaxies']['mass_star_30kpc'] = aperture_masses[4]
+    data_manager['galaxies']['mass_bh_30kpc'] = aperture_masses[5]
+    data_manager['galaxies']['mass_HI_30kpc'] = aperture_masses[10]
+    data_manager['galaxies']['mass_H2_30kpc'] = aperture_masses[11]
+    data_manager['galaxies']['mass_total_30kpc'] = data_manager['galaxies'][['mass_gas_30kpc', 'mass_dm_30kpc', 'mass_star_30kpc', 'mass_bh_30kpc']].sum(axis=1)
 
-  _progress_step(progress, _next_label(labels_iter))
-  calculate_local_densities(data_manager)
-  _progress_step(progress, _next_label(labels_iter))
+    _progress_step(progress, _next_label(labels_iter))
+    calculate_local_densities(data_manager)
+    _progress_step(progress, _next_label(labels_iter))
+  else:
+    _progress_step(progress, _next_label(labels_iter))
+    _progress_step(progress, _next_label(labels_iter))
   progress.close()

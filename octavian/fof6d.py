@@ -182,7 +182,14 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
   data_manager['gas']['temperature'] = 0.
   data_manager['gas']['dense_gas'] = (data_manager['gas']['rho'] > c.nHlim) & ((data_manager['gas']['temperature'] < c.Tlim) | (data_manager['gas']['sfr'] > 0))
   if use_polars:
-    data_manager._invalidate_polars('gas')
+    temperature = data_manager['gas']['temperature'].to_numpy(copy=False)
+    dense_gas = data_manager['gas']['dense_gas'].to_numpy(copy=False)
+    gas_table = data_manager.get_polars_table('gas', mutable=True)
+    gas_table = gas_table.with_columns([
+      pl.Series('temperature', temperature),
+      pl.Series('dense_gas', dense_gas.astype(bool))
+    ])
+    data_manager.set_ptype_from_polars('gas', gas_table)
 
   fof_columns = ['HaloID', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'ptype']
   fof_columns_polars = ['pid'] + fof_columns

@@ -4,7 +4,7 @@ import h5py
 import unyt
 from astropy.cosmology import FlatLambdaCDM
 from sympy import sympify
-from typing import Optional, Sequence, Dict, Any
+from typing import Optional, Sequence, Dict, Any, Iterable, List
 
 try:
   import polars as pl  # type: ignore
@@ -17,7 +17,16 @@ import octavian.constants as c
 
 
 class DataManager:
-  def __init__(self, snapfile: str, fraction: Sequence[float] = (0, 1), mode: str = 'fof', include_unassigned: Optional[bool] = None, use_polars: Optional[bool] = None):
+  def __init__(
+    self,
+    snapfile: str,
+    fraction: Sequence[float] = (0, 1),
+    mode: str = 'fof',
+    include_unassigned: Optional[bool] = None,
+    use_polars: Optional[bool] = None,
+    particle_indices: Optional[Dict[str, Iterable[int]]] = None,
+    particle_ids: Optional[Dict[str, Iterable[int]]] = None,
+  ):
     self.snapfile = snapfile
     self.mode = mode.lower()
     self.start_fraction = fraction[0]
@@ -31,6 +40,23 @@ class DataManager:
       self.use_polars = bool(use_polars)
     self._polars_tables: Dict[str, "pl.DataFrame"] = {}
     self._polars_units: Dict[str, Dict[str, unyt.Unit]] = {}
+    self._particle_indices: Dict[str, np.ndarray] = {}
+    if particle_indices:
+      for ptype, values in particle_indices.items():
+        arr = np.fromiter((int(v) for v in values), dtype=np.int64)
+        if arr.size:
+          self._particle_indices[ptype] = np.unique(arr)
+        else:
+          self._particle_indices[ptype] = arr
+
+    if particle_ids:
+      mapped = self._map_particle_ids_to_indices(particle_ids)
+      for ptype, indices in mapped.items():
+        if ptype in self._particle_indices:
+          combined = np.unique(np.concatenate([self._particle_indices[ptype], indices]))
+          self._particle_indices[ptype] = combined
+        else:
+          self._particle_indices[ptype] = indices
 
     self.load_simulation_constants()
 
@@ -107,19 +133,78 @@ class DataManager:
     with h5py.File(self.snapfile) as f:
       for ptype, name in c.ptypes.items():
         frame = pd.DataFrame()
-        haloids = f[name]['HaloID'][:]
+        index_subset = None
+        if ptype in self._particle_indices:
+          index_subset = self._particle_indices[ptype]
+
+        haloid_dataset = f[name]['HaloID']
+        if index_subset is None:
+          haloids = haloid_dataset[:]
+          dataset_indices = np.arange(len(haloids), dtype=np.int64)
+        else:
+          haloids = haloid_dataset[index_subset]
+          dataset_indices = index_subset.astype(np.int64, copy=False)
+
         if remove_unassigned:
           selection = haloids != 0
-          frame['HaloID'] = haloids[selection]
-          frame.index = np.arange(len(haloids))[selection]
-        else:
-          frame['HaloID'] = haloids
-          frame.index = np.arange(len(haloids))
+          haloids = haloids[selection]
+          dataset_indices = dataset_indices[selection]
 
+        frame['HaloID'] = haloids
         frame['ptype'] = c.ptype_ids[ptype]
-        frame.sort_values(by='HaloID', inplace=True)
+        frame.index = dataset_indices
         frame.rename_axis(index='pid', inplace=True)
+        frame = frame.reset_index().sort_values(by=['HaloID', 'pid']).set_index('pid')
         setattr(self, ptype, frame)
+
+        if self.use_polars and HAS_POLARS:
+          table = pl.DataFrame({
+            'pid': frame.index.to_numpy(dtype=np.int64, copy=False),
+            'HaloID': frame['HaloID'].to_numpy(dtype=np.int64, copy=False),
+            'ptype': np.full(len(frame), c.ptype_ids[ptype], dtype=np.int64),
+          })
+          table = table.sort(['HaloID', 'pid'])
+          self._polars_tables[ptype] = table
+          self._polars_units[ptype] = {}
+
+  def _map_particle_ids_to_indices(self, particle_ids: Dict[str, Iterable[int]]) -> Dict[str, np.ndarray]:
+    index_map: Dict[str, np.ndarray] = {}
+    with h5py.File(self.snapfile) as f:
+      for ptype, ids in particle_ids.items():
+        ids_array = np.fromiter((int(pid) for pid in ids), dtype=np.int64)
+        if ids_array.size == 0:
+          index_map[ptype] = np.array([], dtype=np.int64)
+          continue
+
+        dataset = f[c.ptypes[ptype]][c.prop_aliases['pid']]
+        ids_unique = np.unique(ids_array).astype(dataset.dtype, copy=False)
+
+        matches: List[np.ndarray] = []
+        remaining = ids_unique
+        chunk = max(1, min(1_000_000, dataset.shape[0]))
+        for start in range(0, dataset.shape[0], chunk):
+          block = dataset[start:start + chunk]
+          if block.size == 0:
+            break
+
+          mask = np.isin(block, remaining, assume_unique=True)
+          if mask.any():
+            block_indices = np.flatnonzero(mask) + start
+            matches.append(block_indices)
+            found = block[mask]
+            remaining = remaining[~np.isin(remaining, found, assume_unique=True)]
+            if remaining.size == 0:
+              break
+
+        if remaining.size != 0:
+          raise ValueError(f"Missing particle IDs for {ptype}: {remaining[:10].tolist()} ...")
+
+        if matches:
+          index_map[ptype] = np.unique(np.concatenate(matches))
+        else:
+          index_map[ptype] = np.array([], dtype=np.int64)
+
+    return index_map
 
   def ensure_membership_columns(self) -> None:
     for ptype in c.ptypes.keys():
@@ -127,6 +212,13 @@ class DataManager:
         self[ptype]['GalID'] = -1
       else:
         self[ptype]['GalID'] = self[ptype]['GalID'].astype(int)
+
+      if self.use_polars and HAS_POLARS and ptype in self._polars_tables:
+        gal_values = self[ptype]['GalID'].to_numpy(dtype=np.int64, copy=False)
+        table = self._polars_tables[ptype]
+        table = table.with_columns(pl.Series('GalID', gal_values))
+        self._polars_tables[ptype] = table
+        self._polars_units.setdefault(ptype, {})['GalID'] = None
 
   def validate_halos(self) -> None:
     halos_combined = pd.concat([self[ptype][['HaloID']] for ptype in c.ptypes.keys()]).groupby(by='HaloID').filter(lambda halo: len(halo) >= c.MINIMUM_DM_PER_HALO).sort_values(by='HaloID')
@@ -142,7 +234,11 @@ class DataManager:
     self.haloIDs = np.sort(valid_halos)
 
     for ptype in c.ptypes.keys():
-        self[ptype] = self[ptype].query('HaloID in @valid_halos')
+      self[ptype] = self[ptype].query('HaloID in @valid_halos')
+      if self.use_polars and HAS_POLARS and ptype in self._polars_tables:
+        table = self._polars_tables[ptype]
+        table = table.filter(pl.col('HaloID').is_in(valid_halos))
+        self._polars_tables[ptype] = table
 
   def load_halo_pids(self) -> None:
     for ptype in c.ptypes.keys():
@@ -175,14 +271,38 @@ class DataManager:
     with h5py.File(self.snapfile) as f:
       for ptype, id in c.ptypes.items():
         dataset = c.prop_aliases['bhmass'] if ptype == 'bh' else c.prop_aliases['mass']
-        masses = f[id][dataset][:] * self.get_unit_conversion_factor('mass')
-        self[ptype]['mass'] = masses[self[ptype].index]
+        masses_dset = f[id][dataset]
+        indexer = self[ptype].index.to_numpy(dtype=np.int64, copy=False)
+        factor = self.get_unit_conversion_factor('mass')
 
-        if self.use_polars:
-          self._invalidate_polars(ptype)
-        
-        self[f'n{ptype}'] = len(masses)
-        self[f'm{ptype}_total'] = np.sum(masses)
+        if len(indexer) == 0:
+          masses = np.array([], dtype=float)
+        else:
+          masses = masses_dset[indexer] * factor
+
+        self[ptype]['mass'] = masses
+
+        if self.use_polars and HAS_POLARS and ptype in self._polars_tables:
+          table = self._polars_tables[ptype]
+          if len(indexer) == 0:
+            table = table.with_columns(pl.Series('mass', [], dtype=pl.Float64))
+          else:
+            table = table.with_columns(pl.Series('mass', masses))
+          self._polars_tables[ptype] = table
+          self._polars_units.setdefault(ptype, {})['mass'] = self.create_unit_quantity('mass').units
+        else:
+          if self.use_polars:
+            self._invalidate_polars(ptype)
+
+        self[f'n{ptype}'] = masses_dset.shape[0]
+
+        total_mass = 0.0
+        chunk = max(1, min(1_000_000, masses_dset.shape[0]))
+        for start in range(0, masses_dset.shape[0], chunk):
+          block = masses_dset[start:start + chunk]
+          if block.size:
+            total_mass += block.sum()
+        self[f'm{ptype}_total'] = total_mass * factor
 
   def ensure_property(self, prop: str, ptype: str) -> None:
     column = self.get_column_name(prop)
@@ -225,22 +345,55 @@ class DataManager:
     column = self.get_column_name(requested_prop)
 
     with h5py.File(self.snapfile) as f:
-      data = f[ptype][prop][:]
-      indexer = self[requested_ptype].index
+      dataset = f[ptype][prop]
+      indexer = self[requested_ptype].index.to_numpy(dtype=np.int64, copy=False)
+      has_data = len(indexer) != 0
+      values = dataset[indexer] if has_data else None
+
       if isinstance(column, list):
-        values = data[indexer]
-        for idx, col in enumerate(column):
-          self[requested_ptype][col] = values[:, idx] * self.get_unit_conversion_factor(requested_prop)
+        factor = self.get_unit_conversion_factor(requested_prop)
+        if has_data:
+          scaled = values * factor
+          for idx, col in enumerate(column):
+            self[requested_ptype][col] = scaled[:, idx]
+        else:
+          for col in column:
+            self[requested_ptype][col] = np.array([], dtype=float)
       else:
         if requested_prop == 'metallicity':
-          self[requested_ptype][column] = data[:, 0][indexer]
+          self[requested_ptype][column] = values[:, 0] if has_data else np.array([])
         elif requested_prop == 'age':
-          selection = data[indexer]
-          self[requested_ptype][column] = self.simulation['time_gyr'] - self.cosmology.age(1/selection - 1).value
+          if has_data:
+            selection = values
+            self[requested_ptype][column] = self.simulation['time_gyr'] - self.cosmology.age(1/selection - 1).value
+          else:
+            self[requested_ptype][column] = np.array([])
         else:
           factor = self.get_unit_conversion_factor(requested_prop)
-          self[requested_ptype][column] = data[indexer] * factor
-    if self.use_polars:
+          self[requested_ptype][column] = values * factor if has_data else np.array([])
+
+    if self.use_polars and HAS_POLARS and ptype_key in self._polars_tables:
+      table = self._polars_tables[ptype_key]
+
+      def _series_for(col_name: str) -> pl.Series:
+        pandas_values = self[requested_ptype][col_name].to_numpy(copy=False)
+        dtype = pl.Float64 if pandas_values.dtype.kind in {'f', 'i'} else None
+        return pl.Series(col_name, pandas_values, dtype=dtype)
+
+      if isinstance(column, list):
+        for col_name in column:
+          table = table.with_columns(_series_for(col_name))
+      else:
+        table = table.with_columns(_series_for(column))
+
+      self._polars_tables[ptype_key] = table
+      units = self._polars_units.setdefault(ptype_key, {})
+      if isinstance(column, list):
+        for col_name in column:
+          units[col_name] = self.create_unit_quantity(requested_prop).units if requested_prop in c.code_units else None
+      else:
+        units[column] = self.create_unit_quantity(requested_prop).units if requested_prop in c.code_units else None
+    elif self.use_polars:
       self._invalidate_polars(ptype_key)
 
   # -- Polars helpers --------------------------------------------------
@@ -309,7 +462,12 @@ class DataManager:
       self._polars_tables[ptype] = pl.DataFrame(data)
       self._polars_units[ptype] = units
     table = self._polars_tables[ptype]
-    return table if mutable else table.clone()
+    if mutable:
+      return table
+    clone = table.clone()
+    if not include_index and 'pid' in clone.columns:
+      clone = clone.drop('pid')
+    return clone
 
   def set_ptype_from_polars(self, ptype: str, table: "pl.DataFrame") -> None:
     if not self.use_polars:

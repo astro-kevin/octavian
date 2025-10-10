@@ -216,7 +216,16 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
     gas_table = pl.DataFrame(gas_table) if not isinstance(gas_table, pl.DataFrame) else gas_table
     bh_table = pl.DataFrame(bh_table) if not isinstance(bh_table, pl.DataFrame) else bh_table
 
-    star_counts = star_table.groupby('HaloID').agg(pl.count().alias('count'))
+    if isinstance(star_table, pl.DataFrame):
+      group_method = getattr(star_table, 'groupby', None)
+      if group_method is None:
+        group_method = getattr(star_table, 'group_by', None)
+      if group_method is None:
+        raise TypeError('Polars DataFrame is missing groupby/group_by method')
+      star_counts = group_method('HaloID').agg(pl.count().alias('count'))
+    else:
+      star_counts_pd = star_table.groupby('HaloID').size().reset_index(name='count')
+      star_counts = pl.from_pandas(star_counts_pd)
     valid_haloids = (
       star_counts
       .filter(pl.col('count') >= c.MINIMUM_STARS_PER_GALAXY)

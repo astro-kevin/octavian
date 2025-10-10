@@ -206,13 +206,18 @@ class DataManager:
           index_map[ptype] = np.array([], dtype=np.int64)
           continue
 
+        order = np.argsort(pid_values)
+        sorted_values = pid_values[order]
+
         worker_count = max(1, self._map_threads)
         chunk_size = max(1, int(np.ceil(ids_unique.size / worker_count)))
 
         def _locate(chunk: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-          pos = np.searchsorted(pid_values, chunk)
-          valid = (pos < pid_values.size) & (pid_values[pos] == chunk)
-          return pos[valid], chunk[~valid]
+          pos = np.searchsorted(sorted_values, chunk)
+          valid = (pos < sorted_values.size) & (sorted_values[pos] == chunk)
+          found = order[pos[valid]] if valid.any() else np.array([], dtype=np.int64)
+          missing = chunk[~valid]
+          return found, missing
 
         if worker_count == 1 or ids_unique.size < 2 * chunk_size:
           positions, missing_ids = _locate(ids_unique)

@@ -365,7 +365,7 @@ def _polars_common(df, groupID: str, group_name: str, use_minpot: bool, sim: dic
   ])
 
   df = df.with_columns([
-    pl.sqrt(pl.col('_rel_x')**2 + pl.col('_rel_y')**2 + pl.col('_rel_z')**2).alias('radius'),
+    (pl.col('_rel_x')**2 + pl.col('_rel_y')**2 + pl.col('_rel_z')**2).pow(0.5).alias('radius'),
     (pl.col('_rel_vx')**2 + pl.col('_rel_vy')**2 + pl.col('_rel_vz')**2).alias('_vel_sq'),
     (0.5 * (pl.col('_rel_vx')**2 + pl.col('_rel_vy')**2 + pl.col('_rel_vz')**2) * pl.col('mass')).alias('_ktot'),
     (pl.col('_rel_vx') * pl.col('mass')).alias('_rel_px'),
@@ -386,13 +386,13 @@ def _polars_common(df, groupID: str, group_name: str, use_minpot: bool, sim: dic
   ])
 
   df = df.with_columns([
-    pl.sqrt(pl.col('_Lx_group')**2 + pl.col('_Ly_group')**2 + pl.col('_Lz_group')**2).alias('_L_group_mag'),
+    (pl.col('_Lx_group')**2 + pl.col('_Ly_group')**2 + pl.col('_Lz_group')**2).pow(0.5).alias('_L_group_mag'),
     (pl.col('_Lx') * pl.col('_Lx_group') + pl.col('_Ly') * pl.col('_Ly_group') + pl.col('_Lz') * pl.col('_Lz_group')).alias('_L_dot'),
-    pl.sqrt(
+    (
       (pl.col('_rel_y') * pl.col('_Lz_group') - pl.col('_rel_z') * pl.col('_Ly_group'))**2 +
       (pl.col('_rel_z') * pl.col('_Lx_group') - pl.col('_rel_x') * pl.col('_Lz_group'))**2 +
       (pl.col('_rel_x') * pl.col('_Ly_group') - pl.col('_rel_y') * pl.col('_Lx_group'))**2
-    ).alias('_rz')
+    ).pow(0.5).alias('_rz')
   ])
 
   df = df.with_columns([
@@ -446,7 +446,7 @@ def _polars_common(df, groupID: str, group_name: str, use_minpot: bool, sim: dic
   ])
 
   agg = agg.with_columns([
-    pl.sqrt(_safe_divide(pl.col('_sum_vel_sq'), pl.col(f'n{group_name}'))).alias(f'velocity_dispersion_{group_name}'),
+    _safe_divide(pl.col('_sum_vel_sq'), pl.col(f'n{group_name}')).pow(0.5).alias(f'velocity_dispersion_{group_name}'),
     _safe_divide(2 * pl.col('_bt_mass'), pl.col(f'mass_{group_name}')).alias(f'BoverT_{group_name}'),
     _safe_divide(pl.col('_sum_krot'), pl.col('_sum_ktot')).alias(f'kappa_rot_{group_name}'),
     pl.when(pl.col(f'L_{group_name}') != 0)
@@ -464,7 +464,7 @@ def _polars_common(df, groupID: str, group_name: str, use_minpot: bool, sim: dic
     G_factor = unyt.G.to('(km**2 * kpc)/(Msun * s**2)').d
     agg = agg.with_columns([
       (r200_factor * pl.col(f'mass_{group_name}')**(1/3)).alias('r200'),
-      pl.sqrt(G_factor * pl.col(f'mass_{group_name}') / _safe_divide(pl.col('r200'), pl.lit(1.0))).alias('circular_velocity')
+      (G_factor * pl.col(f'mass_{group_name}') / _safe_divide(pl.col('r200'), pl.lit(1.0))).pow(0.5).alias('circular_velocity')
     ])
     agg = agg.with_columns([
       3.6e5 * (_safe_divide(pl.col('circular_velocity'), pl.lit(100.0))**2).alias('temperature'),

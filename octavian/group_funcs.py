@@ -400,7 +400,7 @@ def _polars_common(df, groupID: str, group_name: str, use_minpot: bool, sim: dic
   ])
 
   df = df.sort([groupID, 'radius']).with_columns([
-    pl.col('mass').cumsum().over(groupID).alias('_cumulative_mass'),
+    pl.col('mass').cum_sum().over(groupID).alias('_cumulative_mass'),
     _safe_divide(pl.col('_cumulative_mass'), pl.col('_mass_sum')).alias('cumulative_mass_fraction')
   ])
 

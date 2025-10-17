@@ -399,9 +399,10 @@ def _polars_common(df, groupID: str, group_name: str, use_minpot: bool, sim: dic
     pl.when(pl.col('_rz') > 0).then(0.5 * (pl.col('_L_dot') / pl.col('_rz'))**2 / pl.col('mass')).otherwise(0.0).alias('_krot')
   ])
 
+  cumulative_mass_expr = pl.col('mass').cum_sum().over(groupID)
   df = df.sort([groupID, 'radius']).with_columns([
-    pl.col('mass').cum_sum().over(groupID).alias('_cumulative_mass'),
-    _safe_divide(pl.col('_cumulative_mass'), pl.col('_mass_sum')).alias('cumulative_mass_fraction')
+    cumulative_mass_expr.alias('_cumulative_mass'),
+    _safe_divide(cumulative_mass_expr, pl.col('_mass_sum')).alias('cumulative_mass_fraction')
   ])
 
   agg = df.groupby(groupID).agg([

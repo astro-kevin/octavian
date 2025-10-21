@@ -1,34 +1,26 @@
 from __future__ import annotations
 import numpy as np
-import pandas as pd
 import unyt
 
 from typing import TYPE_CHECKING, Dict
 if TYPE_CHECKING:
   from octavian.data_manager import DataManager
 
-try:
-  import polars as pl  # type: ignore
-  HAS_POLARS = True
-except Exception:  # pragma: no cover - optional dependency
-  pl = None  # type: ignore
-  HAS_POLARS = False
+from octavian.backend import pd
 
 
 # handle periodic boundary for fof and CoM calculations, reset out of bounds positions during save
-def _ensure_position_units(series: pd.Series, target_unit: unyt.unyt_unit, registry) -> unyt.unyt_array:
+def _ensure_position_units(series: pd.Series, target_unit: unyt.unyt_unit, registry) -> np.ndarray:
   values = series.to_numpy()
   if len(values) == 0:
-    return unyt.unyt_array(values, target_unit, registry=registry)
+    return values.astype(np.float64)
 
   if isinstance(values, unyt.unyt_array):
-    if values.units.is_dimensionless:
-      return unyt.unyt_array(values.value, target_unit, registry=registry)
-    return values.to(target_unit)
+    return values.to_value(target_unit)
 
   if values.dtype == object:
     converted = []
-    for val in values:
+    for val in series:
       if isinstance(val, unyt.unyt_array):
         converted.append(val.to_value(target_unit))
       elif isinstance(val, unyt.unyt_quantity):
@@ -41,9 +33,9 @@ def _ensure_position_units(series: pd.Series, target_unit: unyt.unyt_unit, regis
         converted.append(unyt.unyt_quantity(val.value, val.units, registry=registry).to_value(target_unit))
       else:
         converted.append(float(val))
-    return unyt.unyt_array(np.asarray(converted, dtype=np.float64), target_unit, registry=registry)
+    return np.asarray(converted, dtype=np.float64)
 
-  return unyt.unyt_array(values.astype(np.float64, copy=False), target_unit, registry=registry)
+  return values.astype(np.float64, copy=False)
 
 
 def wrap_positions(data_manager: DataManager) -> None:
@@ -51,10 +43,6 @@ def wrap_positions(data_manager: DataManager) -> None:
   half_box = 0.5 * boxsize
   registry = data_manager.units.registry
   position_unit = unyt.unyt_quantity(1., 'kpc*a', registry=registry).units
-
-  use_polars = getattr(data_manager, 'use_polars', False)
-  if use_polars and not HAS_POLARS:
-    raise RuntimeError('Polars requested for wrap_positions but Polars is unavailable.')
 
   halos_to_wrap = {direction: set() for direction in ['x', 'y', 'z']}
   cached_positions: Dict[str, Dict[str, np.ndarray]] = {}
@@ -72,7 +60,7 @@ def wrap_positions(data_manager: DataManager) -> None:
     pos_columns: Dict[str, np.ndarray] = {}
     for direction in ['x', 'y', 'z']:
       series = frame[direction]
-      pos_columns[direction] = _ensure_position_units(series, position_unit, registry).to_value(position_unit)
+      pos_columns[direction] = _ensure_position_units(series, position_unit, registry)
 
     cached_positions[ptype] = pos_columns
 
@@ -111,8 +99,4 @@ def wrap_positions(data_manager: DataManager) -> None:
         positions[direction] = coords
 
     for direction in ['x', 'y', 'z']:
-      frame.loc[:, direction] = unyt.unyt_array(positions[direction], position_unit, registry=registry)
-
-  if use_polars and HAS_POLARS:
-    for ptype in ['gas', 'dm', 'star', 'bh']:
-      data_manager._invalidate_polars(ptype)
+      frame.loc[:, direction] = positions[direction]

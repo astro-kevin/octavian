@@ -9,10 +9,11 @@ from octavian.saver import Saver
 from octavian.utils import wrap_positions
 from octavian.fof6d import run_fof6d
 from octavian.ahf import load_catalog, apply_ahf_matching, build_galaxies_from_fast
+from octavian.backend import backend_info
 
 
 class OCTAVIAN:
-  def __init__(self, dataset: PathLike, units: dict = {}, nproc: int = 1, mode: str = 'fof', ahf_particles: Optional[PathLike] = None, ahf_halos: Optional[PathLike] = None, use_polars: Optional[bool] = None, *args, **kwargs):
+  def __init__(self, dataset: PathLike, units: dict = {}, nproc: int = 1, mode: str = 'fof', ahf_particles: Optional[PathLike] = None, ahf_halos: Optional[PathLike] = None, use_modin: Optional[bool] = None, *args, **kwargs):
     self._args = args
     self.dataset = dataset
 
@@ -28,14 +29,14 @@ class OCTAVIAN:
     if self.mode in {'ahf', 'ahf-fast'} and self.ahf_particles is None:
       raise ValueError('AHF modes require the path to an AHF_particles catalogue.')
 
-    from octavian.group_funcs import HAS_POLARS
-
-    if not HAS_POLARS:
-      self.use_polars = False
-    elif use_polars is None:
-      self.use_polars = True
+    backend_name, backend_active = backend_info()
+    if use_modin is None:
+      self.use_modin = backend_active
     else:
-      self.use_polars = bool(use_polars)
+      self.use_modin = bool(use_modin)
+      if self.use_modin and not backend_active:
+        raise ImportError('Modin requested but is not available. Install modin to enable this backend.')
+    self.backend_name = backend_name if self.use_modin else "pandas"
 
   def _log_step(self, current: int, total: int, message: str) -> None:
     print(f"[{current}/{total}] {message}", flush=True)
@@ -52,8 +53,8 @@ class OCTAVIAN:
       total_steps = 6
 
     step = 1
-    if self.use_polars:
-      print('Polars backend enabled for pipeline.', flush=True)
+    if self.use_modin:
+      print('Modin backend enabled for pipeline.', flush=True)
     else:
       print('Using pandas backend for pipeline.', flush=True)
 
@@ -62,7 +63,7 @@ class OCTAVIAN:
     data_manager = DataManager(
       self.dataset,
       mode=self.mode,
-      use_polars=self.use_polars,
+      use_modin=self.use_modin,
       map_threads=self.nproc,
     )
     self._log_duration(t1)
@@ -85,7 +86,7 @@ class OCTAVIAN:
 
     self._log_step(step, total_steps, 'Calculating group properties...')
     t1 = perf_counter()
-    calculate_group_properties(data_manager, use_polars=self.use_polars)
+    calculate_group_properties(data_manager)
     self._log_duration(t1)
     step += 1
 

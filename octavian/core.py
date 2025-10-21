@@ -4,17 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Literal, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
-import pandas as pd
+from octavian.backend import pd
 import numpy as np
 
 import octavian.constants as c
-from octavian.ahf import load_catalog, apply_ahf_matching
+from octavian.ahf import load_catalog, apply_ahf_matching, build_galaxies_from_fast
 from octavian.data_manager import DataManager
 from octavian.utils import wrap_positions
 from octavian.fof6d import run_fof6d
 from octavian.group_funcs import calculate_group_properties
+from octavian.backend import backend_info
 
 Mode = Literal["fof", "ahf", "ahf-fast"]
 
@@ -27,7 +28,7 @@ class CoreInputs:
   ahf_particles: Path
   host_ids: Tuple[int, ...]
   mode: Mode = "ahf-fast"
-  use_polars: bool = True
+  use_modin: bool = field(default_factory=lambda: backend_info()[1])
   n_threads: int = 1
   min_stars: int = c.MINIMUM_STARS_PER_GALAXY
 
@@ -38,7 +39,7 @@ class CoreInputs:
     host_ids: Iterable[int],
     *,
     mode: Mode = "ahf-fast",
-    use_polars: bool = True,
+    use_modin: Optional[bool] = None,
     n_threads: int = 1,
     min_stars: int = c.MINIMUM_STARS_PER_GALAXY,
   ) -> None:
@@ -46,7 +47,11 @@ class CoreInputs:
     object.__setattr__(self, "ahf_particles", Path(ahf_particles))
     object.__setattr__(self, "host_ids", tuple(int(h) for h in host_ids))
     object.__setattr__(self, "mode", mode)
-    object.__setattr__(self, "use_polars", bool(use_polars))
+    if use_modin is None:
+      resolved_use_modin = backend_info()[1]
+    else:
+      resolved_use_modin = bool(use_modin)
+    object.__setattr__(self, "use_modin", resolved_use_modin)
     object.__setattr__(self, "n_threads", int(n_threads))
     object.__setattr__(self, "min_stars", int(min_stars))
 
@@ -70,8 +75,8 @@ def run_core(config: CoreInputs) -> CoreResult:  # pragma: no cover - placeholde
   if not config.host_ids:
     raise ValueError("At least one host ID must be supplied to the core")
 
-  if config.mode != "ahf":
-    raise NotImplementedError("Core execution currently supports AHF mode only")
+  if config.mode not in {"ahf", "ahf-fast"}:
+    raise NotImplementedError("Core execution currently supports AHF and AHF-FAST modes")
 
   catalog = load_catalog(str(config.ahf_particles), host_filter=config.host_ids)
 
@@ -100,7 +105,7 @@ def run_core(config: CoreInputs) -> CoreResult:  # pragma: no cover - placeholde
   manager = DataManager(
     str(config.snapshot_path),
     mode=config.mode,
-    use_polars=config.use_polars,
+    use_modin=config.use_modin,
     particle_ids=particle_ids,
     include_unassigned=True,
     map_threads=config.n_threads,
@@ -109,28 +114,52 @@ def run_core(config: CoreInputs) -> CoreResult:  # pragma: no cover - placeholde
   halo_map = {}
   missing = {}
 
-  print("Stage 1/4: Wrapping positions...", flush=True)
-  wrap_positions(manager)
+  if config.mode == "ahf":
+    print("Stage 1/4: Wrapping positions...", flush=True)
+    wrap_positions(manager)
 
-  print("Stage 2/4: Running FoF6D...", flush=True)
-  run_fof6d(manager, nproc=config.n_threads)
+    print("Stage 2/4: Running FoF6D...", flush=True)
+    run_fof6d(manager, nproc=config.n_threads)
 
-  print("Stage 3/4: Matching AHF halos...", flush=True)
-  halo_map, missing = apply_ahf_matching(manager, catalog, n_jobs=config.n_threads)
+    print("Stage 3/4: Matching AHF halos...", flush=True)
+    halo_map, missing = apply_ahf_matching(manager, catalog, n_jobs=config.n_threads)
 
-  print("Stage 4/4: Computing group properties...", flush=True)
-  calculate_group_properties(
-    manager,
-    use_polars=getattr(manager, "use_polars", False),
-    include_global=False,
-  )
+    print("Stage 4/4: Computing group properties...", flush=True)
+    calculate_group_properties(manager, include_global=False)
 
-  metadata: Dict[str, Any] = {
-    "host_ids": list(config.host_ids),
-    "matched_halos": len(halo_map),
-    "missing_particles": dict(missing),
-    "n_galaxies": len(manager.galaxies),
-  }
+    metadata: Dict[str, Any] = {
+      "host_ids": list(config.host_ids),
+      "matched_halos": len(halo_map),
+      "missing_particles": dict(missing),
+      "n_galaxies": len(manager.galaxies),
+    }
+  else:
+    print("Stage 1/3: Building galaxies from AHF-FAST catalogue...", flush=True)
+    missing = build_galaxies_from_fast(
+      manager,
+      catalog,
+      min_stars=config.min_stars,
+      n_jobs=config.n_threads,
+      hosts=config.host_ids,
+    )
+    print(f"  Missing particle counts: {missing}", flush=True)
+
+    for ptype in c.ptypes.keys():
+      manager.load_property('vel', ptype)
+
+    print("Stage 2/3: Wrapping positions...", flush=True)
+    wrap_positions(manager)
+
+    print("Stage 3/3: Computing group properties...", flush=True)
+    calculate_group_properties(manager, include_global=False)
+
+    halo_map = {int(hid): 1 for hid in getattr(manager, "haloIDs", np.array([], dtype=int))}
+    metadata = {
+      "host_ids": list(config.host_ids),
+      "matched_halos": len(halo_map),
+      "missing_particles": dict(missing),
+      "n_galaxies": len(manager.galaxies),
+    }
 
   return CoreResult(
     host_ids=list(config.host_ids),

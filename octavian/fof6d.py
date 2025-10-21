@@ -1,18 +1,12 @@
 from __future__ import annotations
 import numpy as np
-import pandas as pd
 import unyt
 from sklearn.neighbors import NearestNeighbors
 import octavian.constants as c
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
-try:
-  import polars as pl  # type: ignore
-  HAS_POLARS = True
-except Exception:  # pragma: no cover - optional dependency
-  pl = None  # type: ignore
-  HAS_POLARS = False
+from octavian.backend import pd, USING_MODIN
 
 from octavian.ahf import tqdm_joblib
 
@@ -51,8 +45,8 @@ def get_mean_interparticle_separation(data_manager: DataManager) -> None:
   mis = ((dmmass / ndm / rhodm)**(1./3.))/h
   efres = int(boxsize/h/mis)
 
-  data_manager.mis = mis.d
-  data_manager.efres = efres
+  data_manager.mis = float(mis)
+  data_manager.efres = int(efres)
   data_manager.Ob = Ob
 
 
@@ -170,8 +164,6 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
   fof_LL = data_manager.mis * b
   vel_LL = 1.
 
-  use_polars = getattr(data_manager, 'use_polars', False)
-
   for ptype in ['gas', 'dm', 'star', 'bh']:
     data_manager.load_property('vel', ptype)
 
@@ -179,88 +171,34 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
   for prop in ['rho', 'temperature', 'sfr']:
     data_manager.load_property(prop, 'gas')
 
-  data_manager['gas']['temperature'] = 0.
-  data_manager['gas']['dense_gas'] = (data_manager['gas']['rho'] > c.nHlim) & ((data_manager['gas']['temperature'] < c.Tlim) | (data_manager['gas']['sfr'] > 0))
-  if use_polars:
-    temperature = data_manager['gas']['temperature'].to_numpy(copy=False)
-    dense_gas = data_manager['gas']['dense_gas'].to_numpy(copy=False)
-    gas_table = data_manager.get_polars_table('gas', mutable=True)
-    gas_table = gas_table.with_columns([
-      pl.Series('temperature', temperature),
-      pl.Series('dense_gas', dense_gas.astype(bool))
-    ])
-    data_manager.set_ptype_from_polars('gas', gas_table)
+  data_manager['gas']['temperature'] = 0.0
+  data_manager['gas']['dense_gas'] = (
+    (data_manager['gas']['rho'] > c.nHlim)
+    & (
+      (data_manager['gas']['temperature'] < c.Tlim)
+      | (data_manager['gas']['sfr'] > 0)
+    )
+  )
 
   fof_columns = ['HaloID', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'ptype']
-  fof_columns_polars = ['pid'] + fof_columns
   fof_filter = lambda halo: len(halo) >= c.MINIMUM_STARS_PER_GALAXY
 
-  if use_polars:
-    def _ensure_polars_table(table):
-      if not HAS_POLARS:
-        raise RuntimeError('Polars backend requested but Polars is unavailable.')
-      if isinstance(table, pd.DataFrame):
-        if 'pid' not in table.columns:
-          table = table.reset_index().rename(columns={'index': 'pid'})
-        return pl.from_pandas(table)
-      try:
-        return pl.DataFrame(table)
-      except Exception as exc:  # pragma: no cover - defensive
-        raise TypeError('Could not interpret table as a Polars DataFrame') from exc
+  fof_halos = data_manager['star'].groupby('HaloID').filter(fof_filter)
+  fof_haloids = np.unique(fof_halos['HaloID'])
 
-    star_table = _ensure_polars_table(data_manager.get_polars_table('star'))
-    gas_table = _ensure_polars_table(data_manager.get_polars_table('gas'))
-    bh_table = _ensure_polars_table(data_manager.get_polars_table('bh'))
-
-    star_table = pl.DataFrame(star_table) if not isinstance(star_table, pl.DataFrame) else star_table
-    gas_table = pl.DataFrame(gas_table) if not isinstance(gas_table, pl.DataFrame) else gas_table
-    bh_table = pl.DataFrame(bh_table) if not isinstance(bh_table, pl.DataFrame) else bh_table
-
-    if isinstance(star_table, pl.DataFrame):
-      group_method = getattr(star_table, 'groupby', None)
-      if group_method is None:
-        group_method = getattr(star_table, 'group_by', None)
-      if group_method is None:
-        raise TypeError('Polars DataFrame is missing groupby/group_by method')
-      star_counts = group_method('HaloID').agg(pl.count().alias('count'))
-    else:
-      star_counts_pd = star_table.groupby('HaloID').size().reset_index(name='count')
-      star_counts = pl.from_pandas(star_counts_pd)
-    valid_haloids = (
-      star_counts
-      .filter(pl.col('count') >= c.MINIMUM_STARS_PER_GALAXY)
-      .select('HaloID')
-      .to_series()
-      .to_numpy()
-    )
-
-    if valid_haloids.size == 0:
-      grouped = []
-    else:
-      dense_gas = gas_table.filter(pl.col('dense_gas')).select(fof_columns_polars)
-      star_subset = star_table.select(fof_columns_polars)
-      bh_subset = bh_table.select(fof_columns_polars)
-      fof_halos_pl = pl.concat([dense_gas, star_subset, bh_subset], how='vertical_relaxed')
-      fof_halos_pl = fof_halos_pl.filter(pl.col('HaloID').is_in(valid_haloids))
-
-      if fof_halos_pl.is_empty():
-        grouped = []
-      else:
-        fof_halos_pl = fof_halos_pl.with_columns(pl.lit(0).alias('GalID'))
-        halo_partitions = fof_halos_pl.partition_by('HaloID', maintain_order=True, as_dict=False)
-        grouped = []
-        for part in halo_partitions:
-          halo_id_value = int(part['HaloID'][0]) if part.height > 0 else None
-          grouped.append((halo_id_value, part.to_pandas().set_index('pid')))
+  if fof_haloids.size == 0:
+    grouped: list[tuple[int, pd.DataFrame]] = []
   else:
-    fof_halos = data_manager['star'].groupby('HaloID').filter(fof_filter)
-    fof_haloids = np.unique(fof_halos['HaloID'])
-    fof_halos = pd.concat([
-      data_manager['gas'].loc[data_manager['gas']['dense_gas'], fof_columns],
-      data_manager['star'][fof_columns],
-      data_manager['bh'][fof_columns]
-    ]).query('HaloID in @fof_haloids')
-
+    combined = pd.concat(
+      [
+        data_manager['gas'].loc[data_manager['gas']['dense_gas'], fof_columns],
+        data_manager['star'][fof_columns],
+        data_manager['bh'][fof_columns],
+      ],
+    )
+    if USING_MODIN:
+      combined = combined._to_pandas()
+    fof_halos = combined.query('HaloID in @fof_haloids')
     fof_halos['GalID'] = 0
     grouped = list(fof_halos.groupby(by='HaloID'))
 
@@ -283,8 +221,6 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
 
   for ptype in ['gas', 'dm', 'star', 'bh']:
     data_manager[ptype]['GalID'] = -1
-    if use_polars:
-      data_manager._invalidate_polars(ptype)
 
   for i, galaxy in enumerate(galaxies):
     for ptype_id, ptype_indexes in galaxy:

@@ -9,13 +9,6 @@ if TYPE_CHECKING:
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-try:
-  import polars as pl  # type: ignore
-  HAS_POLARS = True
-except Exception:  # pragma: no cover
-  pl = None  # type: ignore
-  HAS_POLARS = False
-
 class Saver:
   def __init__(self, filename: str) -> None:
     self.filename = filename
@@ -94,8 +87,6 @@ class Saver:
 
       for collection in ['halos', 'galaxies']:
         collection_frame = data_manager[collection]
-        if HAS_POLARS and hasattr(collection_frame, 'to_pandas'):
-          collection_frame = collection_frame.to_pandas()
 
         for column, dataset_name in self.column_to_dataset_map.items():
           if column in ['minpotpos', 'minpotvel'] and collection == 'galaxies': continue

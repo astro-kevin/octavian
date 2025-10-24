@@ -25,6 +25,8 @@ _aliases = (
   ("INF", lambda: _np.inf),
   ("PINF", lambda: _np.inf),
   ("NINF", lambda: -_np.inf),
+  ("NZERO", lambda: -0.0),
+  ("PZERO", lambda: 0.0),
 )
 for _name, _factory in _aliases:
   if not hasattr(_np, _name):

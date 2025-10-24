@@ -20,17 +20,42 @@ import pandas as _pandas  # type: ignore
 # numpy 2.0. Provide shims so we stay forward-compatible without requiring a
 # Modin upgrade on every deployment. This is safe because numpy exposes
 # lowercase equivalents (nan, inf, etc.) that we simply mirror.
-_aliases = (
-  ("NAN", lambda: _np.nan),
-  ("INF", lambda: _np.inf),
-  ("PINF", lambda: _np.inf),
-  ("NINF", lambda: -_np.inf),
-  ("NZERO", lambda: -0.0),
-  ("PZERO", lambda: 0.0),
-)
-for _name, _factory in _aliases:
+_alias_factories = {
+  "NAN": lambda: _np.nan,
+  "INF": lambda: _np.inf,
+  "PINF": lambda: _np.inf,
+  "NINF": lambda: -_np.inf,
+  "NZERO": lambda: -0.0,
+  "PZERO": lambda: 0.0,
+}
+
+for _name, _factory in _alias_factories.items():
   if not hasattr(_np, _name):
     setattr(_np, _name, _factory())  # type: ignore[arg-type]
+
+if hasattr(_np, "__getattr__"):
+  _numpy_original_getattr = _np.__getattr__  # type: ignore[attr-defined]
+else:  # pragma: no cover - older numpy
+  _numpy_original_getattr = None
+
+
+def _numpy_compat_getattr(name: str):  # pragma: no cover - simple passthrough
+  alias = _alias_factories.get(name)
+  if alias is not None:
+    value = alias()
+    setattr(_np, name, value)
+    return value
+  lower = name.lower()
+  if lower != name and hasattr(_np, lower):
+    value = getattr(_np, lower)
+    setattr(_np, name, value)
+    return value
+  if _numpy_original_getattr is not None:
+    return _numpy_original_getattr(name)  # type: ignore[misc]
+  raise AttributeError(f"module 'numpy' has no attribute {name!r}")
+
+
+_np.__getattr__ = _numpy_compat_getattr  # type: ignore[assignment]
 
 try:  # pragma: no cover - modin optional
   import modin.pandas as _modin  # type: ignore

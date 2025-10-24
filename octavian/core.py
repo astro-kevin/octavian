@@ -125,7 +125,7 @@ def run_core(config: CoreInputs) -> CoreResult:  # pragma: no cover - placeholde
     halo_map, missing = apply_ahf_matching(manager, catalog, n_jobs=config.n_threads)
 
     print("Stage 4/4: Computing group properties...", flush=True)
-    calculate_group_properties(manager, include_global=False)
+    calculate_group_properties(manager, include_global=True)
 
     metadata: Dict[str, Any] = {
       "host_ids": list(config.host_ids),
@@ -151,7 +151,7 @@ def run_core(config: CoreInputs) -> CoreResult:  # pragma: no cover - placeholde
     wrap_positions(manager)
 
     print("Stage 3/3: Computing group properties...", flush=True)
-    calculate_group_properties(manager, include_global=False)
+    calculate_group_properties(manager, include_global=True)
 
     halo_map = {int(hid): 1 for hid in getattr(manager, "haloIDs", np.array([], dtype=int))}
     metadata = {

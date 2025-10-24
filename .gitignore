@@ -1,3 +1,8 @@
 /build
 /dist
 /*egg-info
+__pycache__/
+octavian/__pycache__/
+plan.md
+test.py
+test-FAST.py

@@ -9,7 +9,7 @@ from astropy import constants as const
 
 from octavian.backend import pd, USING_MODIN
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict
 if TYPE_CHECKING:
   from octavian.data_manager import DataManager
 
@@ -359,20 +359,38 @@ def calculate_local_densities(data_manager: DataManager) -> None:
     pos = collection_data[['x_total', 'y_total', 'z_total']].to_numpy()
     mass = collection_data['mass_total'].to_numpy()
 
+    radii = [300.0, 1000.0, 3000.0]
+
+    valid_mask = np.isfinite(pos).all(axis=1) & np.isfinite(mass)
+    invalid_indices = collection_data.index[~valid_mask]
+    if invalid_indices.size:
+      for radius in radii:
+        collection_data.loc[invalid_indices, f'local_mass_density_{int(radius)}'] = 0.0
+        collection_data.loc[invalid_indices, f'local_number_density_{int(radius)}'] = 0.0
+
+    if not valid_mask.any():
+      continue
+
+    pos_valid = pos[valid_mask]
+    mass_valid = mass[valid_mask]
+    valid_indices = collection_data.index[valid_mask]
+
     neighbors = NearestNeighbors()
-    neighbors.fit(pos)
+    neighbors.fit(pos_valid)
 
     for radius in [300.0, 1000.0, 3000.0]:
       volume = 4.0 / 3.0 * np.pi * radius**3
 
-      df = pd.DataFrame({'indexes': neighbors.radius_neighbors(pos, radius=radius, return_distance=False)})
+      df = pd.DataFrame({'indexes': neighbors.radius_neighbors(pos_valid, radius=radius, return_distance=False)})
       df = df.explode('indexes').dropna()
 
-      df['mass'] = mass[df['indexes'].astype('int')]
+      df['mass'] = mass_valid[df['indexes'].astype('int')]
       grouped = df.groupby(level=0)
 
-      collection_data[f'local_mass_density_{int(radius)}'] = grouped['mass'].sum() / volume
-      collection_data[f'local_number_density_{int(radius)}'] = grouped.size() / volume
+      densities = grouped['mass'].sum() / volume
+      counts = grouped.size() / volume
+      collection_data.loc[valid_indices, f'local_mass_density_{int(radius)}'] = densities
+      collection_data.loc[valid_indices, f'local_number_density_{int(radius)}'] = counts
 
 
 def calculate_group_properties(data_manager: DataManager, include_global: bool = True) -> None:
@@ -473,16 +491,26 @@ def calculate_group_properties(data_manager: DataManager, include_global: bool =
     aperture = 30.0
     galaxy_positions = data_manager['galaxies'][['x_total', 'y_total', 'z_total']].to_numpy()
 
-    process_halo = partial(calculate_aperture_masses, aperture=aperture, galaxy_positions=galaxy_positions)
-    aperture_masses = data.groupby(by='HaloID').apply(process_halo, include_groups=False).reset_index(names=['HaloID', 'GalID'])
-    aperture_masses.set_index('GalID', inplace=True)
+    def process_halo(halo_frame: pd.DataFrame) -> pd.DataFrame:
+      return calculate_aperture_masses(halo_frame, aperture=aperture, galaxy_positions=galaxy_positions)
 
-    data_manager['galaxies']['mass_gas_30kpc'] = aperture_masses[0]
-    data_manager['galaxies']['mass_dm_30kpc'] = aperture_masses[1]
-    data_manager['galaxies']['mass_star_30kpc'] = aperture_masses[4]
-    data_manager['galaxies']['mass_bh_30kpc'] = aperture_masses[5]
-    data_manager['galaxies']['mass_HI_30kpc'] = aperture_masses[10]
-    data_manager['galaxies']['mass_H2_30kpc'] = aperture_masses[11]
-    data_manager['galaxies']['mass_total_30kpc'] = data_manager['galaxies'][['mass_gas_30kpc', 'mass_dm_30kpc', 'mass_star_30kpc', 'mass_bh_30kpc']].sum(axis=1)
+    process_halo.__name__ = f"calculate_aperture_masses_{int(aperture)}kpc"  # type: ignore[attr-defined]
+
+    aperture_masses = data.groupby(by='HaloID').apply(process_halo, include_groups=False)
+
+    if not aperture_masses.empty:
+      aperture_masses = aperture_masses.reset_index(names=['HaloID', 'GalID'])
+      if 'GalID' in aperture_masses:
+        aperture_masses.set_index('GalID', inplace=True)
+
+        def _assign_aperture(column_map: Dict[int, str]) -> None:
+          for dtype, column in column_map.items():
+            if dtype in aperture_masses:
+              data_manager['galaxies'][column] = aperture_masses[dtype]
+
+        _assign_aperture({0: 'mass_gas_30kpc', 1: 'mass_dm_30kpc', 4: 'mass_star_30kpc', 5: 'mass_bh_30kpc', 10: 'mass_HI_30kpc', 11: 'mass_H2_30kpc'})
+
+        if {'mass_gas_30kpc', 'mass_dm_30kpc', 'mass_star_30kpc', 'mass_bh_30kpc'}.issubset(data_manager['galaxies'].columns):
+          data_manager['galaxies']['mass_total_30kpc'] = data_manager['galaxies'][['mass_gas_30kpc', 'mass_dm_30kpc', 'mass_star_30kpc', 'mass_bh_30kpc']].sum(axis=1)
 
     calculate_local_densities(data_manager)

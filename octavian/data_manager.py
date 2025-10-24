@@ -247,8 +247,13 @@ class DataManager:
 
     self.haloIDs = np.sort(valid_halos)
 
+    valid_set = set(valid_halos.tolist())
     for ptype in c.ptypes.keys():
-      self[ptype] = self[ptype].query('HaloID in @valid_halos')
+      frame = self[ptype]
+      if frame.empty:
+        continue
+      mask = frame['HaloID'].isin(valid_set)
+      self[ptype] = frame.loc[mask]
 
   def load_halo_pids(self) -> None:
     for ptype in c.ptypes.keys():

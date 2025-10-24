@@ -10,7 +10,25 @@ from __future__ import annotations
 
 from typing import Tuple
 
+import numpy as _np  # type: ignore
 import pandas as _pandas  # type: ignore
+
+# ---------------------------------------------------------------------------
+# Numpy compatibility helpers
+# ---------------------------------------------------------------------------
+# Modin < 0.37 expects numpy to expose NAN/INF aliases that were removed in
+# numpy 2.0. Provide shims so we stay forward-compatible without requiring a
+# Modin upgrade on every deployment. This is safe because numpy exposes
+# lowercase equivalents (nan, inf, etc.) that we simply mirror.
+_aliases = (
+  ("NAN", lambda: _np.nan),
+  ("INF", lambda: _np.inf),
+  ("PINF", lambda: _np.inf),
+  ("NINF", lambda: -_np.inf),
+)
+for _name, _factory in _aliases:
+  if not hasattr(_np, _name):
+    setattr(_np, _name, _factory())  # type: ignore[arg-type]
 
 try:  # pragma: no cover - modin optional
   import modin.pandas as _modin  # type: ignore

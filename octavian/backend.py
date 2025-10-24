@@ -22,9 +22,13 @@ import pandas as _pandas  # type: ignore
 # lowercase equivalents (nan, inf, etc.) that we simply mirror.
 _alias_factories = {
   "NAN": lambda: _np.nan,
+  "NaN": lambda: _np.nan,
   "INF": lambda: _np.inf,
+  "Inf": lambda: _np.inf,
   "PINF": lambda: _np.inf,
   "NINF": lambda: -_np.inf,
+  "Infinity": lambda: _np.inf,
+  "infty": lambda: _np.inf,
   "NZERO": lambda: -0.0,
   "PZERO": lambda: 0.0,
 }

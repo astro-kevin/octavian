@@ -265,7 +265,11 @@ class DataManager:
       self.halos[c.ptype_lists[ptype]] = plist
 
     for plist in c.ptype_lists.values():
-      self.halos[plist] = self.halos.get(plist, pd.Series(dtype=object)).fillna({i: [] for i in self.halos.index})
+      default = pd.Series([[] for _ in range(len(self.halos.index))], index=self.halos.index, dtype=object)
+      if plist in self.halos:
+        existing = self.halos[plist]
+        default.loc[existing.index] = existing
+      self.halos[plist] = default
 
   def load_galaxy_pids(self) -> None:
     for ptype in c.ptypes.keys():

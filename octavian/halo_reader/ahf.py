@@ -322,6 +322,44 @@ def build_ahf_snapshot_membership_arrays(snapshot, config, particles_path, halos
     print(f'  AHF particle stream: {perf_counter() - t:.1f}s', flush=True)
     return tree, membership_arrays, counts
 
+
+def _paths_from_config(config: dict) -> tuple[Path, Path | None]:
+    particles_path = Path(config['ahf_particles_path'])
+    halos_path = config.get('ahf_halos_path') or None
+    if halos_path is not None:
+        halos_path = Path(halos_path)
+    return particles_path, halos_path
+
+
+def metadata_schema() -> dict[str, str]:
+    return {
+        'original_id_column': 'ID',
+        'halo_id_column': 'AHF_haloID',
+        'parent_id_column': 'AHF_parent_haloID',
+        'top_id_column': 'AHF_top_haloID',
+        'depth_column': 'AHF_depth',
+        'host_index_column': '_ahf_host_halo_index',
+        'ancestor_column': 'AHF_ancestor_haloIDs',
+    }
+
+
+def read_tree(config: dict) -> HaloTree:
+    particles_path, halos_path = _paths_from_config(config)
+    if halos_path is None:
+        halos_path = particles_path.with_name(particles_path.name.replace('particles', 'halos'))
+    tree, _ = read_ahf_tree(halos_path)
+    return tree
+
+
+def build_snapshot_membership_arrays(snapshot, config: dict):
+    particles_path, halos_path = _paths_from_config(config)
+    return build_ahf_snapshot_membership_arrays(snapshot, config, particles_path, halos_path)
+
+
+def load(data_manager, mode='field'):
+    particles_path, halos_path = _paths_from_config(data_manager.config)
+    return load_ahf(data_manager, particles_path, halos_path, mode=mode)
+
 def load_ahf(data_manager, particles_path, halos_path=None, mode='field'):
 
     data_manager.config['halo_source'] = 'ahf'

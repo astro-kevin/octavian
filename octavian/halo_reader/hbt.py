@@ -23,7 +23,14 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from octavian.halo_reader.halo_utils import HaloMembership, HaloReader, HaloTree, PTYPE_ENCODE
+from octavian.halo_reader.halo_utils import (
+    HaloMembership,
+    HaloReader,
+    HaloTree,
+    PTYPE_ENCODE,
+    build_halo_ancestor_arrays,
+    remap_halo_ids,
+)
 
 _SUBSNAP_RE = re.compile(r'^SubSnap_(?P<snap>\d+)(?:\.(?P<file>\d+))?\.hdf5$')
 _HBT_SCALAR_FIELDS = (
@@ -214,6 +221,75 @@ def read_particles(filepaths) -> tuple[np.ndarray, np.ndarray]:
     return np.concatenate(all_hids), np.concatenate(all_pids)
 
 
+def read_hbt_tree(subhalo_path, snap_index=None) -> HaloTree:
+    """Read HBT+ hierarchy and return an Octavian HaloTree."""
+    filepaths = gather_subsnap_files(subhalo_path, snap_index)
+    properties = read_subhalos(filepaths)
+    track_ids = properties['TrackId'].to_numpy(dtype=np.int64)
+    parent_ids = build_parent_ids(properties)
+    halo_ids, parent_ids, _ = remap_halo_ids(track_ids, parent_ids, np.empty(0, dtype=np.int64))
+    return HaloTree(halo_ids, parent_ids, properties)
+
+
+def read_hbt_membership(subhalo_path, snap_index=None) -> tuple[HaloTree, np.ndarray, np.ndarray]:
+    """Read HBT+ hierarchy and particle memberships in compact Octavian IDs."""
+    filepaths = gather_subsnap_files(subhalo_path, snap_index)
+    properties = read_subhalos(filepaths)
+    track_ids = properties['TrackId'].to_numpy(dtype=np.int64)
+    parent_ids = build_parent_ids(properties)
+    member_hids, member_pids = read_particles(filepaths)
+    member_hids = track_ids[member_hids]
+
+    halo_ids, parent_ids, member_hids = remap_halo_ids(track_ids, parent_ids, member_hids)
+    valid_members = member_hids >= 0
+    if not np.all(valid_members):
+        member_hids = member_hids[valid_members]
+        member_pids = member_pids[valid_members]
+
+    return HaloTree(halo_ids, parent_ids, properties), member_hids, member_pids
+
+
+def build_hbt_snapshot_membership_arrays(snapshot, config, subhalo_path, snap_index=None):
+    """Build universal per-particle halo ancestry arrays from HBT+ output."""
+    subhalo_path = Path(subhalo_path)
+    t = perf_counter()
+    tree, member_hids, member_pids = read_hbt_membership(subhalo_path, snap_index)
+    print(f'  HBT halo tree and particles: {perf_counter() - t:.1f}s', flush=True)
+
+    pid_dataset = config.get('prop_aliases', {}).get('pid', 'ParticleIDs')
+    width = int(tree.depths.max()) + 1 if len(tree.depths) else 1
+    ancestor_arrays = build_halo_ancestor_arrays(tree, width)
+
+    membership_arrays = {}
+    counts = {ptype: 0 for ptype in config.get('ptype_names', {})}
+    t = perf_counter()
+    for ptype, ptype_name in config.get('ptype_names', {}).items():
+        if ptype_name not in snapshot or pid_dataset not in snapshot[ptype_name]:
+            continue
+
+        snap_pids = snapshot[ptype_name][pid_dataset][:].astype(np.int64, copy=False)
+        halo_id_array = np.full((len(snap_pids), width), -1, dtype=np.int32)
+        membership_arrays[ptype_name] = halo_id_array
+
+        if len(member_pids) == 0 or len(snap_pids) == 0:
+            continue
+
+        snap_order = np.argsort(snap_pids)
+        snap_pids_sorted = snap_pids[snap_order]
+        positions = np.searchsorted(snap_pids_sorted, member_pids)
+        in_bounds = positions < len(snap_pids_sorted)
+        matched = np.zeros(len(positions), dtype=bool)
+        matched[in_bounds] = snap_pids_sorted[positions[in_bounds]] == member_pids[in_bounds]
+
+        rows = snap_order[positions[matched]]
+        hids = member_hids[matched]
+        halo_id_array[rows] = ancestor_arrays[hids]
+        counts[ptype] = int(len(rows))
+
+    print(f'  HBT particle matching: {perf_counter() - t:.1f}s', flush=True)
+    return tree, membership_arrays, counts
+
+
 def build_parent_ids(properties) -> np.ndarray:
     """
     Construct parent-child relationships from HBT+.
@@ -301,6 +377,49 @@ def label_ptypes(data_manager: DataManager, member_hids: np.ndarray,
     # drop particles not used in Octavian
     valid = out_ptypes != -1
     return member_hids[valid], member_pids[valid], out_ptypes[valid]
+
+
+
+
+def _path_from_config(config: dict):
+    path = config.get('hbt_subhalo_path') or config.get('hbt_path')
+    if path is None:
+        raise KeyError('hbt_subhalo_path must be set to a specific HBT snapshot directory when halo_source is hbt')
+    return path
+
+
+def metadata_schema() -> dict[str, str]:
+    return {
+        'original_id_column': 'TrackId',
+        'halo_id_column': 'HBT_trackID',
+        'parent_id_column': 'HBT_parent_trackID',
+        'top_id_column': 'HBT_top_trackID',
+        'depth_column': 'HBT_depth',
+        'host_index_column': '_hbt_host_halo_index',
+        'ancestor_column': 'HBT_ancestor_trackIDs',
+    }
+
+
+def read_tree(config: dict) -> HaloTree:
+    return read_hbt_tree(_path_from_config(config), config.get('hbt_snap_index'))
+
+
+def build_snapshot_membership_arrays(snapshot, config: dict):
+    return build_hbt_snapshot_membership_arrays(
+        snapshot,
+        config,
+        _path_from_config(config),
+        config.get('hbt_snap_index'),
+    )
+
+
+def load(data_manager: DataManager, mode='field'):
+    return load_hbt(
+        data_manager,
+        _path_from_config(data_manager.config),
+        data_manager.config.get('hbt_snap_index'),
+        mode=mode,
+    )
 
 
 def load_hbt(data_manager: DataManager, subhalo_path: str, snap_index: int | None = None, mode='field'):

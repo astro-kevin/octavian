@@ -3,7 +3,7 @@ import numpy as np
 from time import perf_counter
 from yaml import safe_load
 
-from octavian.halo_reader.ahf import build_ahf_snapshot_membership_arrays, _membership_array_exclusive_ids
+from octavian.halo_reader import build_snapshot_membership_arrays, membership_array_exclusive_ids
 
 def find_nearest(array, value):
     idx = (np.abs(array - value)).argmin()
@@ -32,7 +32,7 @@ def get_id_filter(f: h5py.File, ptypes: list[str], nsplit: int) -> list[list[int
 
   return id_filter
 
-def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: dict, nsplit: int, membership_arrays: dict[str, np.ndarray]):
+def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: dict, nsplit: int, membership_arrays: dict[str, np.ndarray], mode: str):
   for i in range(nsplit):
     with h5py.File(f'{outfile}_{i}.hdf5', 'a') as f_out:
       f.copy(f['Header'], f_out, 'Header')
@@ -71,14 +71,16 @@ def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: d
   for ptype in ptypes:
     halo_id_array = membership_arrays[ptype]
     ids = halo_id_array[:, 0]
-    halo_ids = _membership_array_exclusive_ids(halo_id_array)
+    halo_ids = membership_array_exclusive_ids(halo_id_array) if mode == 'subhalo' else halo_id_array[:, 0]
     particle_index = np.arange(len(ids), dtype='int')
     assigned = np.zeros(len(ids), dtype=bool)
     in_lookup = (ids >= 0) & (ids < len(rank_lookup))
     assigned[in_lookup] = rank_lookup[ids[in_lookup]] >= 0
     rank_ids = rank_lookup[ids[assigned]]
     datasets = [dataset for dataset in f[ptype].keys() if dataset not in ('HaloID', 'HaloID_array', 'particle_index')]
-    datasets += ['HaloID', 'HaloID_array', 'particle_index']
+    datasets += ['HaloID', 'particle_index']
+    if mode == 'subhalo':
+      datasets.append('HaloID_array')
     rank_masks = [rank_ids == i for i in range(nsplit)]
 
     out_files = [h5py.File(f'{outfile}_{i}.hdf5', 'a') for i in range(nsplit)]
@@ -117,18 +119,20 @@ def filter_snapshot(snapfile: str, outfile: str, configfile: str, nsplit: int=4)
     config = safe_load(f)
 
   with h5py.File(snapfile, 'r') as f:
-    if config.get('halo_mode') == 'subhalo':
-      if config.get('halo_source') != 'ahf':
-        raise NotImplementedError('Subhalo HaloID arrays are currently implemented for AHF only')
+    halo_source = config.get('halo_source')
+    halo_mode = config.get('halo_mode', 'field')
+    if halo_source:
       t = perf_counter()
-      print('Building AHF subhalo HaloID arrays...', flush=True)
-      _, membership_arrays, counts = build_ahf_snapshot_membership_arrays(
-        f, config, config['ahf_particles_path'], config.get('ahf_halos_path') or None
-      )
-      print(f'  Built AHF membership arrays: {perf_counter() - t:.1f}s', flush=True)
-      print(f'  AHF memberships written: {int(counts[:4].sum())}, conflicts resolved: {int(counts[7])}', flush=True)
+      print(f'Building {halo_source.upper()} HaloID arrays...', flush=True)
+      _, membership_arrays, counts = build_snapshot_membership_arrays(f, config)
+      print(f'  Built {halo_source.upper()} membership arrays: {perf_counter() - t:.1f}s', flush=True)
+      if isinstance(counts, np.ndarray):
+        print(f'  {halo_source.upper()} memberships written: {int(counts[:4].sum())}, conflicts resolved: {int(counts[7])}', flush=True)
+      else:
+        count_text = ', '.join(f'{ptype}={count}' for ptype, count in counts.items())
+        print(f'  {halo_source.upper()} memberships written: {count_text}', flush=True)
       t = perf_counter()
-      filter_snapshot_with_membership_arrays(f, outfile, config, nsplit, membership_arrays)
+      filter_snapshot_with_membership_arrays(f, outfile, config, nsplit, membership_arrays, halo_mode)
       print(f'  Wrote split snapshots: {perf_counter() - t:.1f}s', flush=True)
       return
 

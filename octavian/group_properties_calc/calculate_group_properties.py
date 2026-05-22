@@ -32,6 +32,7 @@ from octavian.group_properties_calc.group_computations import (
     flatten_membership_array_radius_mass,
 )
 
+from octavian.halo_reader import halo_source_metadata_schema
 from octavian.group_properties_calc.group_helpers import (
     sum_per_group,
     count_per_group,
@@ -185,28 +186,19 @@ def _source_ancestor_halo_ids(tree, source_halo_ids, original_id_column):
 
 
 def _assign_halo_source_properties(data_manager: DataManager) -> None:
-  halo_source = data_manager.config.get('halo_source')
-  if halo_source not in {'ahf', 'hbt'}:
+  schema = halo_source_metadata_schema(data_manager.config)
+  if schema is None:
     return
   if 'halos' not in data_manager.group_data or not hasattr(data_manager, 'halo_tree'):
     return
 
-  if halo_source == 'ahf':
-    original_id_column = 'ID'
-    halo_id_column = 'AHF_haloID'
-    parent_id_column = 'AHF_parent_haloID'
-    top_id_column = 'AHF_top_haloID'
-    depth_column = 'AHF_depth'
-    host_index_column = '_ahf_host_halo_index'
-    ancestor_column = 'AHF_ancestor_haloIDs'
-  else:
-    original_id_column = 'TrackId'
-    halo_id_column = 'HBT_trackID'
-    parent_id_column = 'HBT_parent_trackID'
-    top_id_column = 'HBT_top_trackID'
-    depth_column = 'HBT_depth'
-    host_index_column = '_hbt_host_halo_index'
-    ancestor_column = 'HBT_ancestor_trackIDs'
+  original_id_column = schema['original_id_column']
+  halo_id_column = schema['halo_id_column']
+  parent_id_column = schema['parent_id_column']
+  top_id_column = schema['top_id_column']
+  depth_column = schema['depth_column']
+  host_index_column = schema['host_index_column']
+  ancestor_column = schema['ancestor_column']
 
   tree = data_manager.halo_tree
   halo_data = data_manager.group_data['halos']

@@ -1,6 +1,8 @@
 import h5py
 import numpy as np
+from yaml import safe_dump
 
+from octavian.halo_filter import filter_snapshot
 from octavian.halo_reader.hbt import (
     build_parent_ids,
     gather_subsnap_files,
@@ -98,3 +100,72 @@ def test_build_parent_ids_uses_nested_parent_then_fof_central_fallback(tmp_path)
     properties = read_subhalos(path)
 
     assert build_parent_ids(properties).tolist() == [-1, 100, 101]
+
+
+def _write_snapshot(path):
+    with h5py.File(path, 'w') as f:
+        f.create_group('Header')
+        ptype = f.create_group('PartType1')
+        ptype.create_dataset('ParticleIDs', data=np.array([11, 12, 99], dtype=np.int64))
+        ptype.create_dataset('Masses', data=np.array([1.0, 1.0, 1.0], dtype=np.float64))
+
+
+def _write_config(path, hbt_path, mode):
+    path.write_text(safe_dump({
+        'ptype_names': {'dm': 'PartType1'},
+        'prop_aliases': {'pid': 'ParticleIDs'},
+        'halo_source': 'hbt',
+        'halo_mode': mode,
+        'hbt_subhalo_path': str(hbt_path),
+        'MINIMUM_DM_PER_HALO': 1,
+    }))
+
+
+def test_filter_snapshot_uses_hbt_reader_for_field_mode(tmp_path):
+    snapshot = tmp_path / 'snap.hdf5'
+    hbt_dir = tmp_path / '050'
+    hbt_dir.mkdir()
+    config = tmp_path / 'config.yaml'
+    outfile = tmp_path / 'split'
+    _write_snapshot(snapshot)
+    _write_subsnap(
+        hbt_dir / 'SubSnap_050.0.hdf5',
+        [
+            {'TrackId': 100, 'HostHaloId': 7, 'Rank': 0, 'NestedParentTrackId': -1},
+            {'TrackId': 101, 'HostHaloId': 7, 'Rank': 1, 'NestedParentTrackId': 100},
+        ],
+        [[11], [12]],
+    )
+    _write_config(config, hbt_dir, 'field')
+
+    filter_snapshot(str(snapshot), str(outfile), str(config), nsplit=1)
+
+    with h5py.File(f'{outfile}_0.hdf5', 'r') as f:
+        assert f['PartType1']['HaloID'][:].tolist() == [0, 0]
+        assert 'HaloID_array' not in f['PartType1']
+        assert f['PartType1']['particle_index'][:].tolist() == [0, 1]
+
+
+def test_filter_snapshot_uses_hbt_reader_for_subhalo_mode(tmp_path):
+    snapshot = tmp_path / 'snap.hdf5'
+    hbt_dir = tmp_path / '050'
+    hbt_dir.mkdir()
+    config = tmp_path / 'config.yaml'
+    outfile = tmp_path / 'split'
+    _write_snapshot(snapshot)
+    _write_subsnap(
+        hbt_dir / 'SubSnap_050.0.hdf5',
+        [
+            {'TrackId': 100, 'HostHaloId': 7, 'Rank': 0, 'NestedParentTrackId': -1},
+            {'TrackId': 101, 'HostHaloId': 7, 'Rank': 1, 'NestedParentTrackId': 100},
+        ],
+        [[11], [12]],
+    )
+    _write_config(config, hbt_dir, 'subhalo')
+
+    filter_snapshot(str(snapshot), str(outfile), str(config), nsplit=1)
+
+    with h5py.File(f'{outfile}_0.hdf5', 'r') as f:
+        assert f['PartType1']['HaloID'][:].tolist() == [0, 1]
+        assert f['PartType1']['HaloID_array'][:].tolist() == [[0, -1], [0, 1]]
+        assert f['PartType1']['particle_index'][:].tolist() == [0, 1]

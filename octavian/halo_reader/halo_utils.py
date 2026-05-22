@@ -34,6 +34,62 @@ from numba import njit
 PTYPE_ENCODE = {'gas': 0, 'dm': 1, 'star': 2, 'bh': 3}
 PTYPE_DECODE = {i: j for j, i in PTYPE_ENCODE.items()} # the inverse operation
 
+
+def remap_halo_ids(halo_ids, parent_ids, member_hids):
+    """Map source halo IDs onto compact 0..N-1 IDs used internally."""
+    unique_raw = np.unique(halo_ids)
+    if len(unique_raw) == 0:
+        return (
+            np.empty(0, dtype=np.int64),
+            np.full_like(parent_ids, -1),
+            np.full_like(member_hids, -1),
+        )
+
+    new_halo_ids = np.searchsorted(unique_raw, halo_ids)
+
+    new_parent_ids = np.full_like(parent_ids, -1)
+    valid_parents = parent_ids != -1
+    if np.any(valid_parents):
+        parent_positions = np.searchsorted(unique_raw, parent_ids[valid_parents])
+        in_bounds = parent_positions < len(unique_raw)
+        parent_matched = np.zeros(len(parent_positions), dtype=bool)
+        parent_matched[in_bounds] = unique_raw[parent_positions[in_bounds]] == parent_ids[valid_parents][in_bounds]
+        new_parent_ids[valid_parents] = np.where(parent_matched, parent_positions, -1)
+
+    if len(member_hids) == 0:
+        new_member_hids = np.empty(0, dtype=np.int64)
+    else:
+        member_positions = np.searchsorted(unique_raw, member_hids)
+        in_bounds = member_positions < len(unique_raw)
+        member_matched = np.zeros(len(member_positions), dtype=bool)
+        member_matched[in_bounds] = unique_raw[member_positions[in_bounds]] == member_hids[in_bounds]
+        new_member_hids = np.where(member_matched, member_positions, -1)
+
+    return new_halo_ids, new_parent_ids, new_member_hids
+
+
+def membership_array_exclusive_ids(halo_id_array: np.ndarray) -> np.ndarray:
+    """Return the deepest valid halo ID from each ancestry row."""
+    out = np.full(len(halo_id_array), -1, dtype=np.int64)
+    for col in range(halo_id_array.shape[1]):
+        values = halo_id_array[:, col]
+        np.copyto(out, values, where=values >= 0)
+    return out
+
+
+def build_halo_ancestor_arrays(tree: 'HaloTree', width: int) -> np.ndarray:
+    """Build rows containing each halo's ancestry from top-level to deepest."""
+    arrays = np.full((len(tree._id_to_idx), width), -1, dtype=np.int32)
+    for halo_id in tree.halo_ids:
+        current = int(halo_id)
+        while current != -1:
+            row = tree._id_to_idx[current]
+            if row == -1:
+                break
+            arrays[int(halo_id), int(tree.depths[row])] = current
+            current = int(tree.parent_ids[row])
+    return arrays
+
 class HaloReader:
     """
     Base class for external halo finder integration.
@@ -57,39 +113,7 @@ class HaloReader:
         Map halo-finder-specific IDs to an agnostic 0, 1, 2 (speeds up agnostic classes, easier to work with).
         You need to use searchsorted here as halo IDs can be enormous numbers.
         """
-        # sorted, unique hids
-        unique_raw = np.unique(halo_ids)
-        if len(unique_raw) == 0:
-            return (
-                np.empty(0, dtype=np.int64),
-                np.full_like(parent_ids, -1),
-                np.full_like(member_hids, -1),
-            )
-
-        # find where all halo IDs can be inserted such that the order of unique_raw is preserved
-        new_halo_ids = np.searchsorted(unique_raw, halo_ids)
-        
-        # parents: map known IDs, anything else is -1 as is Octavian tradition
-        new_parent_ids = np.full_like(parent_ids, -1) # set all equal to -1 initially then replace
-        valid_parents = parent_ids != -1 # -1 handles orphan/parent case
-        if np.any(valid_parents): # if any valid parents exist
-            parent_positions = np.searchsorted(unique_raw, parent_ids[valid_parents]) # find where parents can be inserted
-            in_bounds = parent_positions < len(unique_raw)
-            parent_matched = np.zeros(len(parent_positions), dtype=bool)
-            parent_matched[in_bounds] = unique_raw[parent_positions[in_bounds]] == parent_ids[valid_parents][in_bounds] # match positions to IDs
-            new_parent_ids[valid_parents] = np.where(parent_matched, parent_positions, -1) # insert IDs
-        
-        # membership: same logic and structure
-        if len(member_hids) == 0:
-            new_member_hids = np.empty(0, dtype=np.int64)
-        else:
-            member_positions = np.searchsorted(unique_raw, member_hids)
-            in_bounds = member_positions < len(unique_raw)
-            member_matched = np.zeros(len(member_positions), dtype=bool)
-            member_matched[in_bounds] = unique_raw[member_positions[in_bounds]] == member_hids[in_bounds]
-            new_member_hids = np.where(member_matched, member_positions, -1)
-        
-        return new_halo_ids, new_parent_ids, new_member_hids
+        return remap_halo_ids(halo_ids, parent_ids, member_hids)
 
     def assign(self, membership, mode):
         """

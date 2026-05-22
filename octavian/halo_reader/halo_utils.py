@@ -59,6 +59,13 @@ class HaloReader:
         """
         # sorted, unique hids
         unique_raw = np.unique(halo_ids)
+        if len(unique_raw) == 0:
+            return (
+                np.empty(0, dtype=np.int64),
+                np.full_like(parent_ids, -1),
+                np.full_like(member_hids, -1),
+            )
+
         # find where all halo IDs can be inserted such that the order of unique_raw is preserved
         new_halo_ids = np.searchsorted(unique_raw, halo_ids)
         
@@ -67,13 +74,20 @@ class HaloReader:
         valid_parents = parent_ids != -1 # -1 handles orphan/parent case
         if np.any(valid_parents): # if any valid parents exist
             parent_positions = np.searchsorted(unique_raw, parent_ids[valid_parents]) # find where parents can be inserted
-            parent_matched = unique_raw[np.clip(parent_positions, 0, len(unique_raw) - 1)] == parent_ids[valid_parents] # match positions to IDs
+            in_bounds = parent_positions < len(unique_raw)
+            parent_matched = np.zeros(len(parent_positions), dtype=bool)
+            parent_matched[in_bounds] = unique_raw[parent_positions[in_bounds]] == parent_ids[valid_parents][in_bounds] # match positions to IDs
             new_parent_ids[valid_parents] = np.where(parent_matched, parent_positions, -1) # insert IDs
         
         # membership: same logic and structure
-        member_positions = np.searchsorted(unique_raw, member_hids)
-        member_matched = unique_raw[np.clip(member_positions, 0, len(unique_raw) - 1)] == member_hids
-        new_member_hids = np.where(member_matched, member_positions, -1)
+        if len(member_hids) == 0:
+            new_member_hids = np.empty(0, dtype=np.int64)
+        else:
+            member_positions = np.searchsorted(unique_raw, member_hids)
+            in_bounds = member_positions < len(unique_raw)
+            member_matched = np.zeros(len(member_positions), dtype=bool)
+            member_matched[in_bounds] = unique_raw[member_positions[in_bounds]] == member_hids[in_bounds]
+            new_member_hids = np.where(member_matched, member_positions, -1)
         
         return new_halo_ids, new_parent_ids, new_member_hids
 

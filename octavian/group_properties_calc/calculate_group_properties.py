@@ -80,24 +80,24 @@ def _uses_halo_id_arrays(data_manager: DataManager, group_name: str, ptypes: lis
   return True
 
 
-def _ahf_lineage_for_ids(tree, source_halo_ids, output_halo_ids):
+def _source_lineage_for_ids(tree, source_halo_ids, output_halo_ids, original_id_column):
   source_halo_ids = np.asarray(source_halo_ids, dtype=np.int64)
   output_halo_ids = np.asarray(output_halo_ids, dtype=np.int64)
   n = len(source_halo_ids)
 
-  ahf_halo_id = np.full(n, -1, dtype=np.int64)
-  ahf_parent_halo_id = np.full(n, -1, dtype=np.int64)
-  ahf_top_halo_id = np.full(n, -1, dtype=np.int64)
-  ahf_depth = np.full(n, -1, dtype=np.int64)
+  source_id = np.full(n, -1, dtype=np.int64)
+  source_parent_id = np.full(n, -1, dtype=np.int64)
+  source_top_id = np.full(n, -1, dtype=np.int64)
+  source_depth = np.full(n, -1, dtype=np.int64)
   caesar_parent_halo_index = np.full(n, -1, dtype=np.int64)
   caesar_top_halo_index = np.full(n, -1, dtype=np.int64)
 
   if len(tree.halo_ids) == 0:
     return (
-        ahf_halo_id,
-        ahf_parent_halo_id,
-        ahf_top_halo_id,
-        ahf_depth,
+        source_id,
+        source_parent_id,
+        source_top_id,
+        source_depth,
         caesar_parent_halo_index,
         caesar_top_halo_index,
     )
@@ -109,8 +109,8 @@ def _ahf_lineage_for_ids(tree, source_halo_ids, output_halo_ids):
   tree_rows = tree._id_to_idx[valid_ids]
 
   original_ids = tree.halo_ids.copy()
-  if tree.properties is not None and 'ID' in tree.properties:
-    original_ids = tree.properties['ID'].to_numpy(dtype=np.int64)
+  if tree.properties is not None and original_id_column in tree.properties:
+    original_ids = tree.properties[original_id_column].to_numpy(dtype=np.int64)
 
   original_by_halo_id = np.full(max_halo_id, -1, dtype=np.int64)
   original_by_halo_id[tree.halo_ids] = original_ids
@@ -124,35 +124,35 @@ def _ahf_lineage_for_ids(tree, source_halo_ids, output_halo_ids):
   top_ids = np.full(n, -1, dtype=np.int64)
   top_ids[valid] = tree.field_map[valid_ids]
 
-  ahf_halo_id[valid] = original_by_halo_id[valid_ids]
+  source_id[valid] = original_by_halo_id[valid_ids]
   parent_valid = valid & (parent_ids >= 0) & (parent_ids < max_halo_id)
-  ahf_parent_halo_id[parent_valid] = original_by_halo_id[parent_ids[parent_valid]]
+  source_parent_id[parent_valid] = original_by_halo_id[parent_ids[parent_valid]]
   top_valid = valid & (top_ids >= 0) & (top_ids < max_halo_id)
-  ahf_top_halo_id[top_valid] = original_by_halo_id[top_ids[top_valid]]
-  ahf_depth[valid] = tree.depths[tree_rows]
+  source_top_id[top_valid] = original_by_halo_id[top_ids[top_valid]]
+  source_depth[valid] = tree.depths[tree_rows]
 
   caesar_parent_halo_index[parent_valid] = output_by_halo_id[parent_ids[parent_valid]]
   caesar_top_halo_index[top_valid] = output_by_halo_id[top_ids[top_valid]]
 
   return (
-      ahf_halo_id,
-      ahf_parent_halo_id,
-      ahf_top_halo_id,
-      ahf_depth,
+      source_id,
+      source_parent_id,
+      source_top_id,
+      source_depth,
       caesar_parent_halo_index,
       caesar_top_halo_index,
   )
 
 
-def _ahf_ancestor_halo_ids(tree, source_halo_ids):
+def _source_ancestor_halo_ids(tree, source_halo_ids, original_id_column):
   source_halo_ids = np.asarray(source_halo_ids, dtype=np.int64)
   if len(tree.halo_ids) == 0:
     return [np.empty(0, dtype=np.int64) for _ in source_halo_ids]
 
   max_halo_id = len(tree._id_to_idx)
   original_ids = tree.halo_ids.copy()
-  if tree.properties is not None and 'ID' in tree.properties:
-    original_ids = tree.properties['ID'].to_numpy(dtype=np.int64)
+  if tree.properties is not None and original_id_column in tree.properties:
+    original_ids = tree.properties[original_id_column].to_numpy(dtype=np.int64)
 
   original_by_halo_id = np.full(max_halo_id, -1, dtype=np.int64)
   original_by_halo_id[tree.halo_ids] = original_ids
@@ -185,31 +185,49 @@ def _ahf_ancestor_halo_ids(tree, source_halo_ids):
 
 
 def _assign_halo_source_properties(data_manager: DataManager) -> None:
-  if data_manager.config.get('halo_source') != 'ahf':
+  halo_source = data_manager.config.get('halo_source')
+  if halo_source not in {'ahf', 'hbt'}:
     return
   if 'halos' not in data_manager.group_data or not hasattr(data_manager, 'halo_tree'):
     return
+
+  if halo_source == 'ahf':
+    original_id_column = 'ID'
+    halo_id_column = 'AHF_haloID'
+    parent_id_column = 'AHF_parent_haloID'
+    top_id_column = 'AHF_top_haloID'
+    depth_column = 'AHF_depth'
+    host_index_column = '_ahf_host_halo_index'
+    ancestor_column = 'AHF_ancestor_haloIDs'
+  else:
+    original_id_column = 'TrackId'
+    halo_id_column = 'HBT_trackID'
+    parent_id_column = 'HBT_parent_trackID'
+    top_id_column = 'HBT_top_trackID'
+    depth_column = 'HBT_depth'
+    host_index_column = '_hbt_host_halo_index'
+    ancestor_column = 'HBT_ancestor_trackIDs'
 
   tree = data_manager.halo_tree
   halo_data = data_manager.group_data['halos']
   halo_ids = halo_data.index.to_numpy(dtype=np.int64)
   (
-    ahf_halo_id,
-    ahf_parent_halo_id,
-    ahf_top_halo_id,
-    ahf_depth,
+    source_halo_id,
+    source_parent_halo_id,
+    source_top_halo_id,
+    source_depth,
     caesar_parent_halo_index,
     caesar_top_halo_index,
-  ) = _ahf_lineage_for_ids(tree, halo_ids, halo_ids)
+  ) = _source_lineage_for_ids(tree, halo_ids, halo_ids, original_id_column)
 
-  halo_data['AHF_haloID'] = ahf_halo_id
-  halo_data['AHF_parent_haloID'] = ahf_parent_halo_id
-  halo_data['AHF_top_haloID'] = ahf_top_halo_id
-  halo_data['AHF_depth'] = ahf_depth
+  halo_data[halo_id_column] = source_halo_id
+  halo_data[parent_id_column] = source_parent_halo_id
+  halo_data[top_id_column] = source_top_halo_id
+  halo_data[depth_column] = source_depth
   halo_data['caesar_parent_halo_index'] = caesar_parent_halo_index
   halo_data['caesar_top_halo_index'] = caesar_top_halo_index
-  halo_data['AHF_ancestor_haloIDs'] = pd.Series(
-      _ahf_ancestor_halo_ids(tree, halo_ids), index=halo_data.index, dtype=object
+  halo_data[ancestor_column] = pd.Series(
+      _source_ancestor_halo_ids(tree, halo_ids, original_id_column), index=halo_data.index, dtype=object
   )
   halo_data['child'] = caesar_parent_halo_index != -1
 
@@ -219,23 +237,23 @@ def _assign_halo_source_properties(data_manager: DataManager) -> None:
 
   galaxy_source_halo_ids = galaxy_data['parent_halo_index'].to_numpy(dtype=np.int64)
   (
-    ahf_halo_id,
-    ahf_parent_halo_id,
-    ahf_top_halo_id,
-    ahf_depth,
+    source_halo_id,
+    source_parent_halo_id,
+    source_top_halo_id,
+    source_depth,
     caesar_parent_halo_index,
     caesar_top_halo_index,
-  ) = _ahf_lineage_for_ids(tree, galaxy_source_halo_ids, halo_ids)
+  ) = _source_lineage_for_ids(tree, galaxy_source_halo_ids, halo_ids, original_id_column)
 
-  galaxy_data['AHF_haloID'] = ahf_halo_id
-  galaxy_data['AHF_parent_haloID'] = ahf_parent_halo_id
-  galaxy_data['AHF_top_haloID'] = ahf_top_halo_id
-  galaxy_data['AHF_depth'] = ahf_depth
-  galaxy_data['_ahf_host_halo_index'] = caesar_top_halo_index
+  galaxy_data[halo_id_column] = source_halo_id
+  galaxy_data[parent_id_column] = source_parent_halo_id
+  galaxy_data[top_id_column] = source_top_halo_id
+  galaxy_data[depth_column] = source_depth
+  galaxy_data[host_index_column] = caesar_top_halo_index
   galaxy_data['caesar_parent_halo_index'] = caesar_parent_halo_index
   galaxy_data['caesar_top_halo_index'] = caesar_top_halo_index
-  galaxy_data['AHF_ancestor_haloIDs'] = pd.Series(
-      _ahf_ancestor_halo_ids(tree, galaxy_source_halo_ids), index=galaxy_data.index, dtype=object
+  galaxy_data[ancestor_column] = pd.Series(
+      _source_ancestor_halo_ids(tree, galaxy_source_halo_ids, original_id_column), index=galaxy_data.index, dtype=object
   )
 
 

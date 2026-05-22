@@ -153,9 +153,20 @@ class DataManager:
     with h5py.File(self.snapfile) as f:
       for ptype in self.config['ptypes']:
         ptype_name = self.get_ptype_name(ptype)
-        if 'HaloID_array' in f[ptype_name]:
-          self.halo_id_arrays[ptype] = f[ptype_name]['HaloID_array'][:].astype(np.int32, copy=False)
-        self.data[ptype]['HaloID'] = pd.Series(f[ptype_name]['HaloID'][:], dtype='category')
+        ptype_group = f[ptype_name]
+        if 'HaloID_array' in ptype_group:
+          self.halo_id_arrays[ptype] = ptype_group['HaloID_array'][:].astype(np.int32, copy=False)
+        if 'HaloID' in ptype_group:
+          halo_ids = ptype_group['HaloID'][:]
+        else:
+          pid_name = self.get_prop_name('pid')
+          if pid_name in ptype_group:
+            n_particles = len(ptype_group[pid_name])
+          else:
+            first_dataset = next(iter(ptype_group.values()))
+            n_particles = len(first_dataset)
+          halo_ids = np.full(n_particles, -1, dtype=np.int64)
+        self.data[ptype]['HaloID'] = pd.Series(halo_ids, dtype='category')
 
   def get_halo_ids(self, ptype: str, mode: str = 'exclusive') -> np.ndarray:
     if mode == 'exclusive':

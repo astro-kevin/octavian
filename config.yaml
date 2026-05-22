@@ -191,12 +191,39 @@ dataset_columns_by_halo_source:
       galaxies: caesar_top_halo_index
     child:
       halos: child
+  hbt:
+    HBT_trackID:
+      halos: HBT_trackID
+      galaxies: HBT_trackID
+    HBT_parent_trackID:
+      halos: HBT_parent_trackID
+      galaxies: HBT_parent_trackID
+    HBT_top_trackID:
+      halos: HBT_top_trackID
+      galaxies: HBT_top_trackID
+    HBT_depth:
+      halos: HBT_depth
+      galaxies: HBT_depth
+    _hbt_host_halo_index:
+      galaxies: _hbt_host_halo_index
+    caesar_parent_halo_index:
+      halos: caesar_parent_halo_index
+      galaxies: caesar_parent_halo_index
+    caesar_top_halo_index:
+      halos: caesar_top_halo_index
+      galaxies: caesar_top_halo_index
+    child:
+      halos: child
 
 list_dataset_columns_by_halo_source:
   ahf:
     AHF_ancestor_haloIDs:
       halos: AHF_ancestor_haloIDs
       galaxies: AHF_ancestor_haloIDs
+  hbt:
+    HBT_ancestor_trackIDs:
+      halos: HBT_ancestor_trackIDs
+      galaxies: HBT_ancestor_trackIDs
 
 
 prop_columns:

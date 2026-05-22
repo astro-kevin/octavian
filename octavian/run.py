@@ -31,8 +31,7 @@ def run(snapshot: str, outfile: str, configfile: str, logfile: str | None = None
   elif halo_source == 'hbt':
     load_hbt(
       data_manager,
-      config['hbt_subhalo_path'],
-      config['hbt_snap_index'],
+      config.get('hbt_subhalo_path') or config.get('hbt_path'),
       mode=halo_mode,
     )
 

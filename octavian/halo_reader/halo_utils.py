@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from octavian.data_manager import DataManager
 
 from time import perf_counter
+import h5py
 import numpy as np
 import pandas as pd
 from numba import njit
@@ -33,6 +34,7 @@ from numba import njit
 # easier to work with integers than strings
 PTYPE_ENCODE = {'gas': 0, 'dm': 1, 'star': 2, 'bh': 3}
 PTYPE_DECODE = {i: j for j, i in PTYPE_ENCODE.items()} # the inverse operation
+STAGED_HALO_TREE_GROUP = 'OctavianHaloTree'
 
 
 def remap_halo_ids(halo_ids, parent_ids, member_hids):
@@ -89,6 +91,88 @@ def build_halo_ancestor_arrays(tree: 'HaloTree', width: int) -> np.ndarray:
             arrays[int(halo_id), int(tree.depths[row])] = current
             current = int(tree.parent_ids[row])
     return arrays
+
+
+def _empty_tree_properties(properties):
+    if properties is None:
+        return None
+    return properties.iloc[:0].reset_index(drop=True).copy()
+
+
+def prune_halo_tree(tree: 'HaloTree', halo_ids) -> 'HaloTree':
+    """Return a HaloTree containing selected compact halo IDs and their parents."""
+    selected = {int(halo_id) for halo_id in np.asarray(list(halo_ids), dtype=np.int64) if halo_id >= 0}
+    if len(tree.halo_ids) == 0 or not selected:
+        return HaloTree(np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), _empty_tree_properties(tree.properties))
+
+    max_halo_id = len(tree._id_to_idx)
+    closed = set()
+    for halo_id in selected:
+        current = halo_id
+        seen = set()
+        while current != -1 and current not in seen and 0 <= current < max_halo_id:
+            row = tree._id_to_idx[current]
+            if row == -1:
+                break
+            closed.add(current)
+            seen.add(current)
+            current = int(tree.parent_ids[row])
+
+    keep_halo_ids = np.asarray(sorted(closed), dtype=np.int64)
+    rows = tree._id_to_idx[keep_halo_ids]
+    keep_parent_ids = tree.parent_ids[rows]
+    properties = None
+    if tree.properties is not None:
+        properties = tree.properties.iloc[rows].reset_index(drop=True).copy()
+    return HaloTree(keep_halo_ids, keep_parent_ids, properties)
+
+
+def _write_property_dataset(group, name: str, values) -> None:
+    values = np.asarray(values)
+    if values.dtype.kind in 'OUS':
+        values = values.astype(str)
+        dtype = h5py.string_dtype(encoding='utf-8')
+        group.create_dataset(name, data=values, dtype=dtype)
+    else:
+        group.create_dataset(name, data=values)
+
+
+def write_staged_halo_tree(handle, tree: 'HaloTree') -> None:
+    """Write a staged HaloTree into an open HDF5 shard."""
+    if STAGED_HALO_TREE_GROUP in handle:
+        del handle[STAGED_HALO_TREE_GROUP]
+    group = handle.create_group(STAGED_HALO_TREE_GROUP)
+    group.attrs['schema_version'] = 1
+    group.create_dataset('halo_ids', data=tree.halo_ids.astype(np.int64, copy=False))
+    group.create_dataset('parent_ids', data=tree.parent_ids.astype(np.int64, copy=False))
+
+    if tree.properties is None:
+        return
+    properties = group.create_group('properties')
+    for column in tree.properties.columns:
+        _write_property_dataset(properties, str(column), tree.properties[column].to_numpy())
+
+
+def read_staged_halo_tree(handle) -> 'HaloTree | None':
+    """Read a staged HaloTree from an open HDF5 shard if one is present."""
+    if STAGED_HALO_TREE_GROUP not in handle:
+        return None
+    group = handle[STAGED_HALO_TREE_GROUP]
+    halo_ids = group['halo_ids'][:].astype(np.int64, copy=False)
+    parent_ids = group['parent_ids'][:].astype(np.int64, copy=False)
+
+    properties = None
+    if 'properties' in group:
+        columns = {}
+        for column, dataset in group['properties'].items():
+            values = dataset[:]
+            if values.dtype.kind == 'S':
+                values = values.astype(str)
+            columns[column] = values
+        properties = pd.DataFrame(columns)
+
+    return HaloTree(halo_ids, parent_ids, properties)
+
 
 class HaloReader:
     """

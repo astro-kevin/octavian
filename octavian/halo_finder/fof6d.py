@@ -14,21 +14,28 @@ from scipy.spatial import KDTree
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 
+def _global_dm_particle_count(data_manager: 'DataManager') -> int:
+  counts = data_manager.simulation.get('num_part_total')
+  if counts is None or len(counts) <= 1:
+    return 0
+  return int(counts[1])
+
+
+def _assign_no_galaxies(data_manager: 'DataManager', config: dict) -> None:
+  for ptype in config['ptypes']:
+    data_manager.data[ptype]['GalID'] = pd.Series(
+      np.full(len(data_manager.data[ptype]), -1, dtype=np.int64),
+      index=data_manager.data[ptype].index,
+      dtype='category',
+    )
+  config['groups'] = [group for group in config.get('groups', ['halos']) if group != 'galaxies'] or ['halos']
+
+
 # get mis for fof6d
 def get_mean_interparticle_separation(data_manager: 'DataManager') -> None:
-  t = data_manager.simulation['time']
-  a = data_manager.simulation['a']
   h = data_manager.simulation['h']
   Om = data_manager.simulation['O0']
   boxsize = data_manager.simulation['boxsize']
-
-  GRAV = unyt.G.to('cm**3/(g*s**2)').d
-  UL = (1. * unyt.kpc).to('cm').d
-  UM = data_manager.create_unit_quantity('mass').to('g').d
-  UT = t/a
-
-  G = GRAV / UL**3 * UM * UT**2
-  Hubble = 3.2407789e-18 * UT
 
   dmmass = data_manager.mdm_total
   ndm = data_manager.ndm
@@ -38,16 +45,34 @@ def get_mean_interparticle_separation(data_manager: 'DataManager') -> None:
   bhmass = data_manager.mbh_total
 
   bmass = gmass + smass + bhmass
+  total_mass = bmass + dmmass
+  data_manager.Ob = bmass / total_mass * Om if total_mass > 0 else np.nan
 
-  Ob = bmass / (bmass + dmmass) * Om
-  rhodm = (Om - Ob) * 3.0 * Hubble**2 / (8.0 * np.pi * G) / h
+  ndm_global = _global_dm_particle_count(data_manager)
+  if ndm_global > 0:
+    efres = ndm_global ** (1. / 3.)
+    data_manager.mis = boxsize / h / efres
+    data_manager.efres = int(round(efres))
+    return
+
+  if ndm <= 0 or dmmass <= 0:
+    raise ValueError('Cannot determine FOF6D mean interparticle separation without global or local DM particles')
+
+  t = data_manager.simulation['time']
+  a = data_manager.simulation['a']
+
+  GRAV = unyt.G.to('cm**3/(g*s**2)').d
+  UL = (1. * unyt.kpc).to('cm').d
+  UM = data_manager.create_unit_quantity('mass').to('g').d
+  UT = t/a
+
+  G = GRAV / UL**3 * UM * UT**2
+  Hubble = 3.2407789e-18 * UT
+  rhodm = (Om - data_manager.Ob) * 3.0 * Hubble**2 / (8.0 * np.pi * G) / h
 
   mis = ((dmmass / ndm / rhodm)**(1./3.))/h
-  efres = int(boxsize/h/mis)
-
   data_manager.mis = mis
-  data_manager.efres = efres
-  data_manager.Ob = Ob
+  data_manager.efres = int(boxsize/h/mis)
 
 
 # initial assignment of galaxy ids through sorting in x,y,z directions
@@ -244,8 +269,13 @@ def run_fof6d(data_manager: DataManager, nproc: int = 1) -> None:
       data_manager.load_property('mass', ptype)
   t3 = perf_counter()
 
-  data_manager.mdm_total = np.sum(data_manager.data['dm']['mass'])
-  data_manager.ndm = len(data_manager.data['dm'])
+  if 'star' not in config['ptypes'] or len(data_manager.data['star']) == 0:
+    _assign_no_galaxies(data_manager, config)
+    data_manager.logger.info('Skipping FOF6D; no star particles available.')
+    return
+
+  data_manager.mdm_total = 0. if 'dm' not in config['ptypes'] else np.sum(data_manager.data['dm']['mass'])
+  data_manager.ndm = 0 if 'dm' not in config['ptypes'] else len(data_manager.data['dm'])
 
   data_manager.mgas_total = 0. if 'gas' not in config['ptypes'] else np.sum(data_manager.data['gas']['mass'])
   data_manager.mstar_total = 0. if 'star' not in config['ptypes'] else np.sum(data_manager.data['star']['mass'])

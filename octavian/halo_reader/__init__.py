@@ -3,7 +3,14 @@ from __future__ import annotations
 from importlib import import_module
 from types import ModuleType
 
-from octavian.halo_reader.halo_utils import membership_array_exclusive_ids
+import h5py
+
+from octavian.halo_reader.halo_utils import (
+    membership_array_exclusive_ids,
+    prune_halo_tree,
+    read_staged_halo_tree,
+    write_staged_halo_tree,
+)
 
 
 def _halo_source(config_or_source) -> str:
@@ -48,7 +55,12 @@ def load_halo_source(data_manager, mode='field'):
 def load_halo_tree(data_manager, mode='field'):
     """Load only the halo hierarchy for staged snapshots that already contain IDs."""
     source = _halo_source(data_manager.config)
-    tree = get_reader(source).read_tree(data_manager.config)
+    with h5py.File(data_manager.snapfile, 'r') as handle:
+        tree = read_staged_halo_tree(handle)
+    if tree is None:
+        raise RuntimeError(
+            'Staged halo tree missing from split snapshot; rerun filter_snapshot with a current Octavian version.'
+        )
     data_manager.config['halo_source'] = source
     data_manager.config['halo_mode'] = mode
     data_manager.halo_tree = tree

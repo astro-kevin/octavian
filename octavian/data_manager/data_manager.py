@@ -110,6 +110,11 @@ class DataManager:
       self.simulation['h'] = header['HubbleParam']
       self.simulation['redshift'] = header['Redshift']
       self.simulation['a'] = header['Time']
+      if 'NumPart_Total' in header:
+        num_part_total = header['NumPart_Total'].astype(np.int64)
+        if 'NumPart_Total_HighWord' in header:
+          num_part_total = num_part_total + header['NumPart_Total_HighWord'].astype(np.int64) * 2**32
+        self.simulation['num_part_total'] = num_part_total
 
     self.simulation['G'] = unyt.G.to('cm**3/(g * s**2)')
 

@@ -3,7 +3,12 @@ import numpy as np
 from time import perf_counter
 from yaml import safe_load
 
-from octavian.halo_reader import build_snapshot_membership_arrays, membership_array_exclusive_ids
+from octavian.halo_reader import (
+  build_snapshot_membership_arrays,
+  membership_array_exclusive_ids,
+  prune_halo_tree,
+  write_staged_halo_tree,
+)
 
 def find_nearest(array, value):
     idx = (np.abs(array - value)).argmin()
@@ -32,7 +37,7 @@ def get_id_filter(f: h5py.File, ptypes: list[str], nsplit: int) -> list[list[int
 
   return id_filter
 
-def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: dict, nsplit: int, membership_arrays: dict[str, np.ndarray], mode: str):
+def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: dict, nsplit: int, membership_arrays: dict[str, np.ndarray], mode: str, tree=None):
   for i in range(nsplit):
     with h5py.File(f'{outfile}_{i}.hdf5', 'a') as f_out:
       f.copy(f['Header'], f_out, 'Header')
@@ -68,6 +73,8 @@ def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: d
     if halo_ids:
       rank_lookup[np.fromiter(halo_ids, dtype=np.int64)] = rank
 
+  rank_halo_ids = [set() for _ in range(nsplit)]
+
   for ptype in ptypes:
     halo_id_array = membership_arrays[ptype]
     ids = halo_id_array[:, 0]
@@ -82,6 +89,17 @@ def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: d
     if mode == 'subhalo':
       datasets.append('HaloID_array')
     rank_masks = [rank_ids == i for i in range(nsplit)]
+
+    staged_arrays = halo_id_array[assigned]
+    staged_halo_ids = halo_ids[assigned]
+    for i, rank_mask in enumerate(rank_masks):
+      if not np.any(rank_mask):
+        continue
+      if mode == 'subhalo':
+        values = np.unique(staged_arrays[rank_mask])
+      else:
+        values = np.unique(staged_halo_ids[rank_mask])
+      rank_halo_ids[i].update(int(value) for value in values if value >= 0)
 
     out_files = [h5py.File(f'{outfile}_{i}.hdf5', 'a') for i in range(nsplit)]
     try:
@@ -101,6 +119,12 @@ def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: d
     finally:
       for f_out in out_files:
         f_out.close()
+
+  if tree is not None:
+    for i, halo_ids_in_rank in enumerate(rank_halo_ids):
+      pruned_tree = prune_halo_tree(tree, halo_ids_in_rank)
+      with h5py.File(f'{outfile}_{i}.hdf5', 'a') as f_out:
+        write_staged_halo_tree(f_out, pruned_tree)
 
 def filter_snapshot(snapfile: str, outfile: str, configfile: str, nsplit: int=4):
   """
@@ -124,7 +148,7 @@ def filter_snapshot(snapfile: str, outfile: str, configfile: str, nsplit: int=4)
     if halo_source:
       t = perf_counter()
       print(f'Building {halo_source.upper()} HaloID arrays...', flush=True)
-      _, membership_arrays, counts = build_snapshot_membership_arrays(f, config)
+      tree, membership_arrays, counts = build_snapshot_membership_arrays(f, config)
       print(f'  Built {halo_source.upper()} membership arrays: {perf_counter() - t:.1f}s', flush=True)
       if isinstance(counts, np.ndarray):
         print(f'  {halo_source.upper()} memberships written: {int(counts[:4].sum())}, conflicts resolved: {int(counts[7])}', flush=True)
@@ -132,7 +156,7 @@ def filter_snapshot(snapfile: str, outfile: str, configfile: str, nsplit: int=4)
         count_text = ', '.join(f'{ptype}={count}' for ptype, count in counts.items())
         print(f'  {halo_source.upper()} memberships written: {count_text}', flush=True)
       t = perf_counter()
-      filter_snapshot_with_membership_arrays(f, outfile, config, nsplit, membership_arrays, halo_mode)
+      filter_snapshot_with_membership_arrays(f, outfile, config, nsplit, membership_arrays, halo_mode, tree=tree)
       print(f'  Wrote split snapshots: {perf_counter() - t:.1f}s', flush=True)
       return
 

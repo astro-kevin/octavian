@@ -86,6 +86,23 @@ def _uses_halo_id_arrays(data_manager: DataManager, group_name: str, ptypes: lis
   return True
 
 
+def _load_property_if_missing(data_manager: DataManager, prop: str, ptype: str) -> None:
+  columns = data_manager.get_column_name(prop)
+  if isinstance(columns, str):
+    columns = [columns]
+  if all(column in data_manager.data[ptype] for column in columns):
+    return
+  data_manager.load_property(prop, ptype)
+
+
+def _load_halo_common_particle_inputs(data_manager: DataManager) -> None:
+  for ptype in data_manager.config['ptypes']:
+    _load_property_if_missing(data_manager, 'pos', ptype)
+    _load_property_if_missing(data_manager, 'vel', ptype)
+    _load_property_if_missing(data_manager, 'bhmass' if ptype == 'bh' else 'mass', ptype)
+    _load_property_if_missing(data_manager, 'potential', ptype)
+
+
 def _source_lineage_for_ids(tree, source_halo_ids, output_halo_ids, original_id_column):
   source_halo_ids = np.asarray(source_halo_ids, dtype=np.int64)
   output_halo_ids = np.asarray(output_halo_ids, dtype=np.int64)
@@ -1207,13 +1224,16 @@ def calculate_group_properties(data_manager: DataManager) -> None:
   # admin
   config = data_manager.config
 
+  groups = config['groups']
+
   t2 = perf_counter()
-  for ptype in config['ptypes']:
-    data_manager.load_property('potential', ptype)
+  if 'halos' in groups:
+    _load_halo_common_particle_inputs(data_manager)
+  else:
+    for ptype in config['ptypes']:
+      data_manager.load_property('potential', ptype)
   t3 = perf_counter()
   t4 = t5 = t6 = t7 = t8 = t9 = t3
-
-  groups = config['groups']
 
   to_process = config['to_process']
   aperture_velocities_needed = 'apertures' in to_process and 'galaxies' in config['groups']

@@ -15,7 +15,7 @@ def _column_for_group(column, group_name: str):
 
 
 def _empty_values(dataset: str, length: int):
-  if '_L' in dataset:
+  if dataset in {'pos', 'vel', 'minpotpos', 'minpotvel'} or '_L' in dataset:
     return np.full((length, 3), np.nan)
   return np.full(length, np.nan)
 
@@ -76,6 +76,11 @@ def _write_merged_csr_dataset(out_group, dataset: str, files: list[str], group_k
   for file in files:
     n_rows = file_lengths[length_key][file]
     with h5py.File(file, 'r') as f_in:
+      if group_key not in f_in:
+        all_indices.append(np.empty(0, dtype=np.int64))
+        all_lengths.append(np.zeros(n_rows, dtype=np.int32))
+        continue
+
       group = f_in[group_key]
       indices_name = f'{dataset}_indices'
       lengths_name = f'{dataset}_lengths'
@@ -156,8 +161,12 @@ def merge_catalogues(files: list[str], outfile: str, configfile: str) -> None:
 
   halo_masses = np.concatenate(halo_masses)
   halo_source_ids = np.concatenate(halo_source_ids)
-  galaxy_masses = np.concatenate(galaxy_masses)
-  galaxy_parent_halo = np.concatenate(galaxy_parent_halo)
+  if galaxy_masses:
+    galaxy_masses = np.concatenate(galaxy_masses)
+    galaxy_parent_halo = np.concatenate(galaxy_parent_halo)
+  else:
+    galaxy_masses = np.empty(0, dtype=float)
+    galaxy_parent_halo = np.empty(0, dtype=np.int64)
 
   halo_order = np.argsort(halo_masses)
   galaxy_order = np.argsort(galaxy_masses)

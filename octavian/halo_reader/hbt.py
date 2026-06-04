@@ -388,7 +388,7 @@ def _path_from_config(config: dict):
     return path
 
 
-def metadata_schema() -> dict[str, str]:
+def metadata_schema() -> dict[str, object]:
     return {
         'original_id_column': 'TrackId',
         'halo_id_column': 'HBT_trackID',
@@ -397,6 +397,10 @@ def metadata_schema() -> dict[str, str]:
         'depth_column': 'HBT_depth',
         'host_index_column': '_hbt_host_halo_index',
         'ancestor_column': 'HBT_ancestor_trackIDs',
+        'halo_index_columns': {
+            'halos': ['caesar_parent_halo_index', 'caesar_top_halo_index'],
+            'galaxies': ['caesar_parent_halo_index', 'caesar_top_halo_index', '_hbt_host_halo_index'],
+        },
     }
 
 

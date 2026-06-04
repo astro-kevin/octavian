@@ -331,7 +331,7 @@ def _paths_from_config(config: dict) -> tuple[Path, Path | None]:
     return particles_path, halos_path
 
 
-def metadata_schema() -> dict[str, str]:
+def metadata_schema() -> dict[str, object]:
     return {
         'original_id_column': 'ID',
         'halo_id_column': 'AHF_haloID',
@@ -340,6 +340,10 @@ def metadata_schema() -> dict[str, str]:
         'depth_column': 'AHF_depth',
         'host_index_column': '_ahf_host_halo_index',
         'ancestor_column': 'AHF_ancestor_haloIDs',
+        'halo_index_columns': {
+            'halos': ['caesar_parent_halo_index', 'caesar_top_halo_index'],
+            'galaxies': ['caesar_parent_halo_index', 'caesar_top_halo_index', '_ahf_host_halo_index'],
+        },
     }
 
 

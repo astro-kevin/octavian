@@ -72,6 +72,11 @@ def _group_index_map(group_data) -> np.ndarray:
   return group_map
 
 
+def _assign_empty_common_particle_properties(group_data, particle_type: str, n_groups: int) -> None:
+  group_data[f'n{particle_type}'] = np.zeros(n_groups, dtype=np.int64)
+  group_data[f'mass_{particle_type}'] = np.zeros(n_groups, dtype=float)
+
+
 def _uses_halo_id_arrays(data_manager: DataManager, group_name: str, ptypes: list[str]) -> bool:
   if group_name != 'halos' or not data_manager.halo_id_arrays:
     return False
@@ -457,6 +462,7 @@ def common_group_properties(data_manager: DataManager, group_name: str, particle
   groupID_key = config['groupIDs'][group_name]
   group_data = data_manager.group_data[group_name]
   n_groups = len(group_data)
+  _assign_empty_common_particle_properties(group_data, particle_type, n_groups)
 
   # -
   # step 1: extract arrays from datamanager so the entire operation can be vectorised

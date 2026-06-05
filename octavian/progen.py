@@ -125,13 +125,14 @@ class _HBTLinks(_BaseHaloLinks):
     def __init__(self, progenitor_spec: _PathSpec, progenitor_halos: _GroupSnapshot):
         properties = _read_hbt_properties(progenitor_spec)
         self._previous_sources = _unique_sources(progenitor_halos.source_ids)
+        self._progenitor_masses = _mass_lookup(progenitor_halos.source_ids, progenitor_halos.masses)
         self._by_descendant = _hbt_progenitors_by_descendant(properties)
 
     def candidates_for_source_ids(self, source_ids, limit: int | None) -> list[np.ndarray]:
         source_ids = np.asarray(source_ids, dtype=np.int64)
         out = []
+        stable = _isin_sorted(source_ids, self._previous_sources)
         if limit == 1:
-            stable = _isin_sorted(source_ids, self._previous_sources)
             for source_id, has_stable in zip(source_ids, stable):
                 candidates = []
                 if has_stable and source_id >= 0:
@@ -144,11 +145,14 @@ class _HBTLinks(_BaseHaloLinks):
                 out.append(np.asarray(candidates, dtype=np.int64))
             return out
 
-        for source_id in source_ids:
-            values = self._by_descendant.values_for(int(source_id), limit)
-            if len(values) == 0 and source_id >= 0 and _isin_sorted(np.asarray([source_id]), self._previous_sources)[0]:
-                values = np.asarray([source_id], dtype=np.int64)
-            out.append(values.astype(np.int64, copy=False))
+        for source_id, has_stable in zip(source_ids, stable):
+            candidates = [int(value) for value in self._by_descendant.values_for(int(source_id))]
+            if has_stable and source_id >= 0:
+                candidates.append(int(source_id))
+            values = _sort_sources_by_mass(candidates, self._progenitor_masses)
+            if limit is not None:
+                values = values[:limit]
+            out.append(np.asarray(values, dtype=np.int64))
         return out
 
 

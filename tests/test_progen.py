@@ -179,13 +179,18 @@ def test_hbt_main_progenitor_prefers_stable_trackid_then_descendant_fallback(tmp
     assert result[0]['progen_halos'].tolist() == [7, 9, -1]
 
 
-def test_hbt_multiple_progenitors_group_by_descendant_and_sort_by_mbound(tmp_path):
+def test_hbt_multiple_progenitors_include_stable_trackid_and_sort_by_mass(tmp_path):
     current = tmp_path / 'oct_151.hdf5'
     previous = tmp_path / 'oct_150.hdf5'
     hbt_root = tmp_path / 'hbt'
     _write_octavian(current, [{'id': 0, 'source': 200}])
-    _write_octavian(previous, [{'id': 8, 'source': 201}, {'id': 9, 'source': 202}])
+    _write_octavian(previous, [
+        {'id': 7, 'source': 200, 'mass': 6.0},
+        {'id': 8, 'source': 201, 'mass': 4.0},
+        {'id': 9, 'source': 202, 'mass': 8.0},
+    ])
     _write_hbt(hbt_root, 150, [
+        {'TrackId': 200, 'Mbound': 6.0, 'Nbound': 60, 'DescendantTrackId': -1},
         {'TrackId': 201, 'Mbound': 4.0, 'Nbound': 40, 'DescendantTrackId': 200},
         {'TrackId': 202, 'Mbound': 8.0, 'Nbound': 80, 'DescendantTrackId': 200},
     ])
@@ -194,13 +199,13 @@ def test_hbt_multiple_progenitors_group_by_descendant_and_sort_by_mbound(tmp_pat
         [current, previous],
         hbt_root,
         group_type='halos',
-        progenitors=2,
+        progenitors=3,
         halo_source='hbt',
         snap_indices=[151, 150],
         save=False,
     )
 
-    assert result[0]['progen_halos'].tolist() == [[9, 8]]
+    assert result[0]['progen_halos'].tolist() == [[9, 7, 8]]
 
 
 def test_group_type_all_writes_halos_and_star_overlap_galaxies(tmp_path):
@@ -253,8 +258,13 @@ def test_all_progenitors_write_csr_datasets(tmp_path):
     previous = tmp_path / 'oct_150.hdf5'
     hbt_root = tmp_path / 'hbt'
     _write_octavian(current, [{'id': 0, 'source': 200}])
-    _write_octavian(previous, [{'id': 8, 'source': 201}, {'id': 9, 'source': 202}])
+    _write_octavian(previous, [
+        {'id': 7, 'source': 200, 'mass': 6.0},
+        {'id': 8, 'source': 201, 'mass': 4.0},
+        {'id': 9, 'source': 202, 'mass': 8.0},
+    ])
     _write_hbt(hbt_root, 150, [
+        {'TrackId': 200, 'Mbound': 6.0, 'Nbound': 60, 'DescendantTrackId': -1},
         {'TrackId': 201, 'Mbound': 4.0, 'Nbound': 40, 'DescendantTrackId': 200},
         {'TrackId': 202, 'Mbound': 8.0, 'Nbound': 80, 'DescendantTrackId': 200},
     ])
@@ -271,9 +281,9 @@ def test_all_progenitors_write_csr_datasets(tmp_path):
 
     with h5py.File(current, 'r') as handle:
         tree = handle['tree_data']
-        assert tree['progen_halos_indices'][:].tolist() == [9, 8]
+        assert tree['progen_halos_indices'][:].tolist() == [9, 7, 8]
         assert tree['progen_halos_offsets'][:].tolist() == [0]
-        assert tree['progen_halos_lengths'][:].tolist() == [2]
+        assert tree['progen_halos_lengths'][:].tolist() == [3]
 
 
 def test_hbt_m25n256_151_to_150_readonly_integration():

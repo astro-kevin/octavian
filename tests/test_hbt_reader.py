@@ -252,6 +252,58 @@ def test_filter_snapshot_uses_hbt_reader_for_subhalo_mode(tmp_path):
         assert f['PartType1']['particle_index'][:].tolist() == [0, 1]
 
 
+def test_filter_snapshot_streams_properties_with_rankid_chunks(tmp_path):
+    snapshot = tmp_path / 'snap.hdf5'
+    hbt_dir = tmp_path / '050'
+    hbt_dir.mkdir()
+    config = tmp_path / 'config.yaml'
+    outfile = tmp_path / 'split'
+
+    particle_ids = np.asarray([11, 21, 12, 99, 22, 13], dtype=np.int64)
+    with h5py.File(snapshot, 'w') as f:
+        f.create_group('Header')
+        ptype = f.create_group('PartType1')
+        ptype.create_dataset('ParticleIDs', data=particle_ids)
+        ptype.create_dataset('Masses', data=np.arange(len(particle_ids), dtype=np.float64))
+        ptype.create_dataset('Coordinates', data=np.arange(len(particle_ids) * 3, dtype=np.float32).reshape(len(particle_ids), 3))
+
+    _write_subsnap(
+        hbt_dir / 'SubSnap_050.0.hdf5',
+        [
+            {'TrackId': 100, 'HostHaloId': 7, 'Rank': 0, 'NestedParentTrackId': -1},
+            {'TrackId': 200, 'HostHaloId': 8, 'Rank': 0, 'NestedParentTrackId': -1},
+        ],
+        [[11, 12, 13], [21, 22]],
+    )
+    config.write_text(safe_dump({
+        'ptype_names': {'dm': 'PartType1'},
+        'prop_aliases': {'pid': 'ParticleIDs'},
+        'halo_source': 'hbt',
+        'halo_mode': 'subhalo',
+        'hbt_subhalo_path': str(hbt_dir),
+        'MINIMUM_DM_PER_HALO': 1,
+        'staging_property_chunk_rows': 2,
+    }))
+
+    filter_snapshot(str(snapshot), str(outfile), str(config), nsplit=2)
+
+    with h5py.File(f'{outfile}_0.hdf5', 'r') as f:
+        assert f['PartType1']['ParticleIDs'][:].tolist() == [11, 12, 13]
+        assert f['PartType1']['Masses'][:].tolist() == [0.0, 2.0, 5.0]
+        assert f['PartType1']['Coordinates'][:].tolist() == [[0.0, 1.0, 2.0], [6.0, 7.0, 8.0], [15.0, 16.0, 17.0]]
+        assert f['PartType1']['HaloID'][:].tolist() == [0, 0, 0]
+        assert f['PartType1']['HaloID_array'][:].tolist() == [[0], [0], [0]]
+        assert f['PartType1']['particle_index'][:].tolist() == [0, 2, 5]
+
+    with h5py.File(f'{outfile}_1.hdf5', 'r') as f:
+        assert f['PartType1']['ParticleIDs'][:].tolist() == [21, 22]
+        assert f['PartType1']['Masses'][:].tolist() == [1.0, 4.0]
+        assert f['PartType1']['Coordinates'][:].tolist() == [[3.0, 4.0, 5.0], [12.0, 13.0, 14.0]]
+        assert f['PartType1']['HaloID'][:].tolist() == [1, 1]
+        assert f['PartType1']['HaloID_array'][:].tolist() == [[1], [1]]
+        assert f['PartType1']['particle_index'][:].tolist() == [1, 4]
+
+
 def test_filter_snapshot_writes_pruned_staged_tree_per_top_halo(tmp_path):
     snapshot = tmp_path / 'snap.hdf5'
     hbt_dir = tmp_path / '050'

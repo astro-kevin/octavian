@@ -171,6 +171,91 @@ def membership_top_ids(halo_id_array) -> np.ndarray:
     return halo_id_array[:, 0]
 
 
+def membership_top_id_counts(halo_id_array) -> tuple[np.ndarray, np.ndarray]:
+    """Return unique top-level halo IDs and counts without densifying sparse inputs."""
+    if sp.issparse(halo_id_array):
+        top = halo_id_array.tocsc(copy=False)[0:1, :].tocoo(copy=False)
+        values = top.data.astype(np.int64, copy=False)
+    else:
+        values = halo_id_array[:, 0].astype(np.int64, copy=False)
+
+    values = values[values >= 0]
+    if len(values) == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    return np.unique(values, return_counts=True)
+
+
+def membership_rank_ids(halo_id_array, rank_lookup: np.ndarray, dtype=np.int16) -> np.ndarray:
+    """Return a dense particle-aligned rank vector, with -1 for unstaged particles."""
+    n_particles = membership_particle_count(halo_id_array)
+    rank_ids = np.full(n_particles, -1, dtype=dtype)
+    if len(rank_lookup) == 0 or n_particles == 0:
+        return rank_ids
+
+    if sp.issparse(halo_id_array):
+        top = halo_id_array.tocsc(copy=False)[0:1, :].tocoo(copy=False)
+        if top.nnz == 0:
+            return rank_ids
+        particle_rows = top.col.astype(np.int64, copy=False)
+        halo_ids = top.data.astype(np.int64, copy=False)
+    else:
+        halo_ids = halo_id_array[:, 0].astype(np.int64, copy=False)
+        particle_rows = np.arange(n_particles, dtype=np.int64)
+
+    in_lookup = (halo_ids >= 0) & (halo_ids < len(rank_lookup))
+    if not np.any(in_lookup):
+        return rank_ids
+
+    particle_rows = particle_rows[in_lookup]
+    ranks = rank_lookup[halo_ids[in_lookup]]
+    assigned = ranks >= 0
+    if np.any(assigned):
+        rank_ids[particle_rows[assigned]] = ranks[assigned].astype(dtype, copy=False)
+    return rank_ids
+
+
+def membership_selected_top_ids(halo_id_array, particle_indices: np.ndarray) -> np.ndarray:
+    """Return top-level halo IDs for selected particle rows."""
+    particle_indices = np.asarray(particle_indices, dtype=np.int64)
+    if len(particle_indices) == 0:
+        return np.empty(0, dtype=np.int64)
+
+    if sp.issparse(halo_id_array):
+        selected = halo_id_array.tocsc(copy=False)[:, particle_indices]
+        top = selected[0:1, :].tocoo(copy=False)
+        out = np.full(len(particle_indices), -1, dtype=np.int64)
+        if top.nnz:
+            out[top.col.astype(np.int64, copy=False)] = top.data.astype(np.int64, copy=False)
+        return out
+
+    return halo_id_array[particle_indices, 0].astype(np.int64, copy=False)
+
+
+def membership_selected_exclusive_ids(halo_id_array, particle_indices: np.ndarray) -> np.ndarray:
+    """Return deepest valid halo IDs for selected particle rows."""
+    particle_indices = np.asarray(particle_indices, dtype=np.int64)
+    if len(particle_indices) == 0:
+        return np.empty(0, dtype=np.int64)
+
+    if sp.issparse(halo_id_array):
+        selected = halo_id_array.tocsc(copy=False)[:, particle_indices]
+        out = np.full(len(particle_indices), -1, dtype=np.int64)
+        starts = selected.indptr[:-1]
+        ends = selected.indptr[1:]
+        nonempty = starts < ends
+        if np.any(nonempty):
+            last = ends[nonempty] - 1
+            out[np.flatnonzero(nonempty)] = selected.data[last].astype(np.int64, copy=False)
+        return out
+
+    selected = halo_id_array[particle_indices]
+    out = np.full(len(selected), -1, dtype=np.int64)
+    for depth in range(selected.shape[1]):
+        values = selected[:, depth]
+        np.copyto(out, values, where=values >= 0)
+    return out
+
+
 def membership_selected_particles_dense(halo_id_array, particle_indices: np.ndarray) -> np.ndarray:
     """Return selected particles as dense particle x depth ancestry rows."""
     particle_indices = np.asarray(particle_indices, dtype=np.int64)

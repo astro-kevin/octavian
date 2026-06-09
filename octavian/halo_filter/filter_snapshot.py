@@ -51,12 +51,6 @@ def _rank_dtype(nsplit: int):
   return np.int32
 
 
-def _rank_counts(rank_ids: np.ndarray, nsplit: int) -> np.ndarray:
-  valid = rank_ids >= 0
-  if not np.any(valid):
-    return np.zeros(nsplit, dtype=np.int64)
-  return np.bincount(rank_ids[valid].astype(np.int64, copy=False), minlength=nsplit)[:nsplit].astype(np.int64, copy=False)
-
 
 def _chunk_rows_for_row_bytes(n_rows: int, row_bytes: int, config: dict) -> int:
   configured_rows = config.get('staging_property_chunk_rows', config.get('staging_chunk_rows'))
@@ -77,118 +71,172 @@ def _chunk_rows_for_row_bytes(n_rows: int, row_bytes: int, config: dict) -> int:
   return max(1, min(n_rows, max_rows, target_bytes // row_bytes))
 
 
-def _chunk_rows_for_dataset(dataset, config: dict) -> int:
+
+def _output_chunk_shape(shape_tail: tuple, dtype, input_chunk_rows: int, config: dict) -> tuple:
+  shape_tail = tuple(int(axis) for axis in shape_tail)
+  row_elements = int(np.prod(shape_tail, dtype=np.int64)) if shape_tail else 1
+  row_bytes = max(np.dtype(dtype).itemsize * row_elements, 1)
+  target_bytes = int(config.get('staging_output_chunk_bytes', 16 * 1024**2))
+  rows = max(1, min(int(input_chunk_rows), max(1, target_bytes // row_bytes)))
+  return (rows,) + shape_tail
+
+
+def _create_extendible_dataset(group, name: str, shape_tail: tuple, dtype, input_chunk_rows: int, config: dict):
+  shape_tail = tuple(int(axis) for axis in shape_tail)
+  if name in group:
+    del group[name]
+  return group.create_dataset(
+    name,
+    shape=(0,) + shape_tail,
+    maxshape=(None,) + shape_tail,
+    chunks=_output_chunk_shape(shape_tail, dtype, input_chunk_rows, config),
+    dtype=dtype,
+  )
+
+
+def _create_extendible_outputs(groups, name: str, shape_tail: tuple, dtype, input_chunk_rows: int, config: dict) -> list:
+  return [_create_extendible_dataset(group, name, shape_tail, dtype, input_chunk_rows, config) for group in groups]
+
+
+def _append_values(dataset, values) -> None:
+  n_write = len(values)
+  if n_write == 0:
+    return
+  old_size = len(dataset)
+  new_size = old_size + n_write
+  dataset.resize((new_size,) + dataset.shape[1:])
+  dataset[old_size:new_size] = values
+
+
+def _append_chunk_values_by_rank(outputs: list, values, rows_by_rank: list[np.ndarray]) -> None:
+  for rank, rows in enumerate(rows_by_rank):
+    if len(rows) == 0:
+      continue
+    _append_values(outputs[rank], values[rows])
+
+
+def _append_selected_values_by_rank(outputs: list, values, selected_positions_by_rank: list[np.ndarray]) -> None:
+  for rank, positions in enumerate(selected_positions_by_rank):
+    if len(positions) == 0:
+      continue
+    _append_values(outputs[rank], values[positions])
+
+
+def _source_dataset_row_bytes(dataset) -> int:
   row_shape = dataset.shape[1:]
   row_elements = int(np.prod(row_shape, dtype=np.int64)) if row_shape else 1
-  return _chunk_rows_for_row_bytes(len(dataset), dataset.dtype.itemsize * row_elements, config)
+  return dataset.dtype.itemsize * row_elements
 
 
-def _create_ranked_datasets(groups, name: str, counts: np.ndarray, shape_tail: tuple, dtype) -> list:
-  outputs = []
-  shape_tail = tuple(int(axis) for axis in shape_tail)
-  for group, count in zip(groups, counts):
-    if name in group:
-      del group[name]
-    outputs.append(group.create_dataset(name, shape=(int(count),) + shape_tail, dtype=dtype))
-  return outputs
+def _staging_chunk_rows(n_particles: int, source_datasets: list, halo_id_array, mode: str, config: dict) -> int:
+  row_bytes = np.dtype(np.int64).itemsize  # particle_index
+  row_bytes += np.dtype(np.int64).itemsize  # HaloID
+  if mode == 'subhalo':
+    row_bytes += membership_depth_width(halo_id_array) * np.dtype(np.int32).itemsize
+  for dataset in source_datasets:
+    row_bytes += _source_dataset_row_bytes(dataset)
+  return _chunk_rows_for_row_bytes(n_particles, row_bytes, config)
 
 
-def _check_cursors(name: str, cursors: np.ndarray, counts: np.ndarray) -> None:
-  if not np.array_equal(cursors, counts):
-    raise RuntimeError(f'{name} staging wrote {cursors.tolist()} rows but expected {counts.tolist()}')
+def _chunk_rank_rows(rank_ids: np.ndarray, start: int, end: int, nsplit: int):
+  rank_chunk = rank_ids[start:end]
+  selected_rows = np.flatnonzero(rank_chunk >= 0).astype(np.int32, copy=False)
+  if len(selected_rows) == 0:
+    empty = [np.empty(0, dtype=np.int32) for _ in range(nsplit)]
+    return selected_rows, empty, empty
+
+  selected_ranks = rank_chunk[selected_rows]
+  selected_positions_by_rank = [
+    np.flatnonzero(selected_ranks == rank).astype(np.int32, copy=False)
+    for rank in range(nsplit)
+  ]
+  rows_by_rank = [selected_rows[positions] for positions in selected_positions_by_rank]
+  return selected_rows, rows_by_rank, selected_positions_by_rank
 
 
-def _write_selected_values_by_rank(values, value_ranks: np.ndarray, outputs: list, cursors: np.ndarray, nsplit: int) -> None:
-  for rank in range(nsplit):
-    mask = value_ranks == rank
-    n_write = int(np.count_nonzero(mask))
-    if n_write == 0:
+def _stage_ptype_by_row_chunks(
+  f: h5py.File,
+  ptype: str,
+  groups: list,
+  halo_id_array,
+  rank_ids: np.ndarray,
+  config: dict,
+  nsplit: int,
+  mode: str,
+  rank_halo_ids: list[set[int]],
+) -> None:
+  n_particles = membership_particle_count(halo_id_array)
+  source_names = [dataset for dataset in f[ptype].keys() if dataset not in ('HaloID', 'HaloID_array', 'particle_index')]
+  source_specs = []
+  for name in source_names:
+    dataset = f[ptype][name]
+    if len(dataset) != n_particles:
+      raise ValueError(f'{ptype}/{name} has {len(dataset)} rows but expected {n_particles}')
+    source_specs.append((name, dataset))
+
+  source_datasets = [dataset for _, dataset in source_specs]
+  chunk_rows = _staging_chunk_rows(n_particles, source_datasets, halo_id_array, mode, config)
+  print(f'{ptype} staging chunk_rows={chunk_rows} datasets={len(source_specs)}', flush=True)
+
+  source_outputs = {
+    name: _create_extendible_outputs(groups, name, dataset.shape[1:], dataset.dtype, chunk_rows, config)
+    for name, dataset in source_specs
+  }
+  halo_outputs = _create_extendible_outputs(groups, 'HaloID', (), np.int64, chunk_rows, config)
+  particle_index_outputs = _create_extendible_outputs(groups, 'particle_index', (), np.int64, chunk_rows, config)
+  halo_array_outputs = None
+  if mode == 'subhalo':
+    halo_array_outputs = _create_extendible_outputs(groups, 'HaloID_array', (membership_depth_width(halo_id_array),), np.int32, chunk_rows, config)
+
+  halo_selector = membership_selected_exclusive_ids if mode == 'subhalo' else membership_selected_top_ids
+  timings = {name: 0.0 for name, _ in source_specs}
+  timings['HaloID'] = 0.0
+  timings['particle_index'] = 0.0
+  if mode == 'subhalo':
+    timings['HaloID_array'] = 0.0
+  routing_time = 0.0
+
+  for start in range(0, n_particles, chunk_rows):
+    end = min(start + chunk_rows, n_particles)
+    t = perf_counter()
+    selected_rows, rows_by_rank, selected_positions_by_rank = _chunk_rank_rows(rank_ids, start, end, nsplit)
+    routing_time += perf_counter() - t
+    if len(selected_rows) == 0:
       continue
-    cursor = int(cursors[rank])
-    outputs[rank][cursor:cursor + n_write] = values[mask]
-    cursors[rank] += n_write
 
+    global_rows = selected_rows.astype(np.int64, copy=False) + start
 
-def _copy_source_dataset_by_rank(source_dataset, outputs: list, rank_ids: np.ndarray, counts: np.ndarray, config: dict, nsplit: int) -> None:
-  chunk_rows = _chunk_rows_for_dataset(source_dataset, config)
-  cursors = np.zeros(nsplit, dtype=np.int64)
-  for start in range(0, len(source_dataset), chunk_rows):
-    end = min(start + chunk_rows, len(source_dataset))
-    rank_chunk = rank_ids[start:end]
-    if not np.any(rank_chunk >= 0):
-      continue
-
-    data_chunk = source_dataset[start:end]
-    for rank in range(nsplit):
-      mask = rank_chunk == rank
-      n_write = int(np.count_nonzero(mask))
-      if n_write == 0:
-        continue
-      cursor = int(cursors[rank])
-      outputs[rank][cursor:cursor + n_write] = data_chunk[mask]
-      cursors[rank] += n_write
-
-  _check_cursors(source_dataset.name, cursors, counts)
-
-
-def _write_particle_index_by_rank(outputs: list, rank_ids: np.ndarray, counts: np.ndarray, config: dict, nsplit: int) -> None:
-  chunk_rows = _chunk_rows_for_row_bytes(len(rank_ids), np.dtype(np.int64).itemsize, config)
-  cursors = np.zeros(nsplit, dtype=np.int64)
-  for start in range(0, len(rank_ids), chunk_rows):
-    end = min(start + chunk_rows, len(rank_ids))
-    rank_chunk = rank_ids[start:end]
-    assigned = rank_chunk >= 0
-    if not np.any(assigned):
-      continue
-    values = (np.flatnonzero(assigned).astype(np.int64, copy=False) + start)
-    _write_selected_values_by_rank(values, rank_chunk[assigned], outputs, cursors, nsplit)
-
-  _check_cursors('particle_index', cursors, counts)
-
-
-def _write_halo_ids_by_rank(outputs: list, rank_ids: np.ndarray, counts: np.ndarray, halo_id_array, mode: str, config: dict, nsplit: int, rank_halo_ids: list[set[int]]) -> None:
-  chunk_rows = _chunk_rows_for_row_bytes(len(rank_ids), np.dtype(np.int64).itemsize, config)
-  cursors = np.zeros(nsplit, dtype=np.int64)
-  selector = membership_selected_exclusive_ids if mode == 'subhalo' else membership_selected_top_ids
-
-  for start in range(0, len(rank_ids), chunk_rows):
-    end = min(start + chunk_rows, len(rank_ids))
-    rank_chunk = rank_ids[start:end]
-    assigned = rank_chunk >= 0
-    if not np.any(assigned):
-      continue
-
-    rows = np.flatnonzero(assigned).astype(np.int64, copy=False) + start
-    values = selector(halo_id_array, rows)
-    value_ranks = rank_chunk[assigned]
-    _write_selected_values_by_rank(values, value_ranks, outputs, cursors, nsplit)
-
-    for rank in range(nsplit):
-      rank_values = values[value_ranks == rank]
-      if len(rank_values):
+    t = perf_counter()
+    halo_values = halo_selector(halo_id_array, global_rows)
+    _append_selected_values_by_rank(halo_outputs, halo_values, selected_positions_by_rank)
+    for rank, positions in enumerate(selected_positions_by_rank):
+      if len(positions):
+        rank_values = halo_values[positions]
         rank_halo_ids[rank].update(int(value) for value in np.unique(rank_values) if value >= 0)
+    timings['HaloID'] += perf_counter() - t
 
-  _check_cursors('HaloID', cursors, counts)
+    if halo_array_outputs is not None:
+      t = perf_counter()
+      halo_array_values = membership_selected_particles_dense(halo_id_array, global_rows)
+      _append_selected_values_by_rank(halo_array_outputs, halo_array_values, selected_positions_by_rank)
+      timings['HaloID_array'] += perf_counter() - t
 
+    t = perf_counter()
+    for rank, rows in enumerate(rows_by_rank):
+      if len(rows) == 0:
+        continue
+      _append_values(particle_index_outputs[rank], rows.astype(np.int64, copy=False) + start)
+    timings['particle_index'] += perf_counter() - t
 
-def _write_halo_id_array_by_rank(outputs: list, rank_ids: np.ndarray, counts: np.ndarray, halo_id_array, config: dict, nsplit: int) -> None:
-  row_bytes = membership_depth_width(halo_id_array) * np.dtype(np.int32).itemsize
-  chunk_rows = _chunk_rows_for_row_bytes(len(rank_ids), row_bytes, config)
-  cursors = np.zeros(nsplit, dtype=np.int64)
+    for name, dataset in source_specs:
+      t = perf_counter()
+      data_chunk = dataset[start:end]
+      _append_chunk_values_by_rank(source_outputs[name], data_chunk, rows_by_rank)
+      timings[name] += perf_counter() - t
 
-  for start in range(0, len(rank_ids), chunk_rows):
-    end = min(start + chunk_rows, len(rank_ids))
-    rank_chunk = rank_ids[start:end]
-    assigned = rank_chunk >= 0
-    if not np.any(assigned):
-      continue
-
-    rows = np.flatnonzero(assigned).astype(np.int64, copy=False) + start
-    values = membership_selected_particles_dense(halo_id_array, rows)
-    _write_selected_values_by_rank(values, rank_chunk[assigned], outputs, cursors, nsplit)
-
-  _check_cursors('HaloID_array', cursors, counts)
-
+  print(f'{ptype} routing: {routing_time:.1f}s', flush=True)
+  for name in list(source_outputs) + ['HaloID', 'particle_index'] + (['HaloID_array'] if mode == 'subhalo' else []):
+    print(f'{ptype} {name}: {timings[name]:.1f}s', flush=True)
 
 def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: dict, nsplit: int, membership_arrays: dict[str, np.ndarray], mode: str, tree=None):
   for i in range(nsplit):
@@ -230,34 +278,12 @@ def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: d
 
   for ptype in ptypes:
     halo_id_array = membership_arrays[ptype]
-    n_particles = membership_particle_count(halo_id_array)
     rank_ids = membership_rank_ids(halo_id_array, rank_lookup, dtype=rank_dtype)
-    counts = _rank_counts(rank_ids, nsplit)
-    datasets = [dataset for dataset in f[ptype].keys() if dataset not in ('HaloID', 'HaloID_array', 'particle_index')]
-    datasets += ['HaloID', 'particle_index']
-    if mode == 'subhalo':
-      datasets.append('HaloID_array')
 
     out_files = [h5py.File(f'{outfile}_{i}.hdf5', 'a') for i in range(nsplit)]
     try:
       groups = [f_out.require_group(ptype) for f_out in out_files]
-      for dataset in datasets:
-        print(ptype, dataset, flush=True)
-        if dataset == 'HaloID':
-          outputs = _create_ranked_datasets(groups, dataset, counts, (), np.int64)
-          _write_halo_ids_by_rank(outputs, rank_ids, counts, halo_id_array, mode, config, nsplit, rank_halo_ids)
-        elif dataset == 'HaloID_array':
-          outputs = _create_ranked_datasets(groups, dataset, counts, (membership_depth_width(halo_id_array),), np.int32)
-          _write_halo_id_array_by_rank(outputs, rank_ids, counts, halo_id_array, config, nsplit)
-        elif dataset == 'particle_index':
-          outputs = _create_ranked_datasets(groups, dataset, counts, (), np.int64)
-          _write_particle_index_by_rank(outputs, rank_ids, counts, config, nsplit)
-        else:
-          source_dataset = f[ptype][dataset]
-          if len(source_dataset) != n_particles:
-            raise ValueError(f'{ptype}/{dataset} has {len(source_dataset)} rows but expected {n_particles}')
-          outputs = _create_ranked_datasets(groups, dataset, counts, source_dataset.shape[1:], source_dataset.dtype)
-          _copy_source_dataset_by_rank(source_dataset, outputs, rank_ids, counts, config, nsplit)
+      _stage_ptype_by_row_chunks(f, ptype, groups, halo_id_array, rank_ids, config, nsplit, mode, rank_halo_ids)
     finally:
       for f_out in out_files:
         f_out.close()

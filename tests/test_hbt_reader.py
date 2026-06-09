@@ -3,11 +3,13 @@ from types import SimpleNamespace
 import h5py
 import pytest
 import numpy as np
+import scipy.sparse as sp
 from yaml import safe_dump
 
 from octavian.halo_filter import filter_snapshot
-from octavian.halo_reader import load_halo_tree
+from octavian.halo_reader import load_halo_tree, membership_selected_particles_dense
 from octavian.halo_reader.hbt import (
+    build_hbt_snapshot_membership_arrays,
     build_parent_ids,
     gather_subsnap_files,
     read_particles,
@@ -126,6 +128,78 @@ def _write_config(path, hbt_path, mode):
         'hbt_subhalo_path': str(hbt_path),
         'MINIMUM_DM_PER_HALO': 1,
     }))
+
+
+def test_hbt_membership_arrays_are_sparse_depth_by_particle(tmp_path):
+    snapshot = tmp_path / 'snap.hdf5'
+    hbt_dir = tmp_path / '050'
+    hbt_dir.mkdir()
+    _write_snapshot(snapshot)
+    _write_subsnap(
+        hbt_dir / 'SubSnap_050.0.hdf5',
+        [
+            {'TrackId': 100, 'HostHaloId': 7, 'Rank': 0, 'NestedParentTrackId': -1},
+            {'TrackId': 101, 'HostHaloId': 7, 'Rank': 1, 'NestedParentTrackId': 100},
+        ],
+        [[11], [12]],
+    )
+    config = {
+        'ptype_names': {'dm': 'PartType1'},
+        'prop_aliases': {'pid': 'ParticleIDs'},
+    }
+
+    with h5py.File(snapshot, 'r') as f:
+        _, membership_arrays, _ = build_hbt_snapshot_membership_arrays(f, config, hbt_dir)
+
+    halo_id_array = membership_arrays['PartType1']
+    assert sp.issparse(halo_id_array)
+    assert halo_id_array.format == 'csc'
+    assert halo_id_array.shape == (2, 3)
+    assert halo_id_array.nnz == 3
+    assert halo_id_array.data.tolist() == [0, 0, 1]
+    assert membership_selected_particles_dense(halo_id_array, [0, 1, 2]).tolist() == [[0, -1], [0, 1], [-1, -1]]
+
+
+def test_hbt_membership_matching_scans_snapshot_ptypes_in_chunks(tmp_path):
+    snapshot = tmp_path / 'snap.hdf5'
+    hbt_dir = tmp_path / '050'
+    hbt_dir.mkdir()
+    with h5py.File(snapshot, 'w') as f:
+        f.create_group('Header')
+        gas = f.create_group('PartType0')
+        gas.create_dataset('ParticleIDs', data=np.asarray([31, 11, 41], dtype=np.int64))
+        gas.create_dataset('Masses', data=np.ones(3, dtype=np.float64))
+        dm = f.create_group('PartType1')
+        dm.create_dataset('ParticleIDs', data=np.asarray([12, 99, 21], dtype=np.int64))
+        dm.create_dataset('Masses', data=np.ones(3, dtype=np.float64))
+    _write_subsnap(
+        hbt_dir / 'SubSnap_050.0.hdf5',
+        [
+            {'TrackId': 100, 'HostHaloId': 7, 'Rank': 0, 'NestedParentTrackId': -1},
+            {'TrackId': 101, 'HostHaloId': 7, 'Rank': 1, 'NestedParentTrackId': 100},
+        ],
+        [[12, 11], [21, 31]],
+    )
+    config = {
+        'ptype_names': {'gas': 'PartType0', 'dm': 'PartType1'},
+        'prop_aliases': {'pid': 'ParticleIDs'},
+        'hbt_particle_id_chunk_size': 2,
+    }
+
+    with h5py.File(snapshot, 'r') as f:
+        _, membership_arrays, counts = build_hbt_snapshot_membership_arrays(f, config, hbt_dir)
+
+    assert counts == {'gas': 2, 'dm': 2}
+    assert membership_selected_particles_dense(membership_arrays['PartType0'], [0, 1, 2]).tolist() == [
+        [0, 1],
+        [0, -1],
+        [-1, -1],
+    ]
+    assert membership_selected_particles_dense(membership_arrays['PartType1'], [0, 1, 2]).tolist() == [
+        [0, -1],
+        [-1, -1],
+        [0, 1],
+    ]
 
 
 def test_filter_snapshot_uses_hbt_reader_for_field_mode(tmp_path):

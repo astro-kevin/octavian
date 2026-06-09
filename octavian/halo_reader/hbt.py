@@ -30,6 +30,7 @@ from octavian.halo_reader.halo_utils import (
     PTYPE_ENCODE,
     build_halo_ancestor_arrays,
     remap_halo_ids,
+    sparse_membership_from_particle_ancestors,
 )
 
 _SUBSNAP_RE = re.compile(r'^SubSnap_(?P<snap>\d+)(?:\.(?P<file>\d+))?\.hdf5$')
@@ -249,6 +250,64 @@ def read_hbt_membership(subhalo_path, snap_index=None) -> tuple[HaloTree, np.nda
     return HaloTree(halo_ids, parent_ids, properties), member_hids, member_pids
 
 
+def _hbt_particle_id_chunk_size(config: dict) -> int:
+    chunk_size = int(config.get('hbt_particle_id_chunk_size', 20_000_000))
+    if chunk_size < 1:
+        raise ValueError('hbt_particle_id_chunk_size must be positive')
+    return chunk_size
+
+
+def _sort_hbt_memberships(member_hids: np.ndarray, member_pids: np.ndarray) -> tuple[np.ndarray, np.ndarray, bool]:
+    if len(member_pids) == 0:
+        return member_hids, member_pids, False
+    order = np.argsort(member_pids)
+    sorted_pids = member_pids[order].astype(np.int64, copy=False)
+    sorted_hids = member_hids[order].astype(np.int64, copy=False)
+    has_duplicate_pids = bool(np.any(sorted_pids[1:] == sorted_pids[:-1])) if len(sorted_pids) > 1 else False
+    return sorted_hids, sorted_pids, has_duplicate_pids
+
+
+def _match_hbt_members_to_snapshot_rows(
+    pid_dataset,
+    member_hids_sorted: np.ndarray,
+    member_pids_sorted: np.ndarray,
+    has_duplicate_member_pids: bool,
+    chunk_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    row_chunks = []
+    hid_chunks = []
+    n_members = len(member_pids_sorted)
+
+    for start in range(0, len(pid_dataset), chunk_size):
+        end = min(start + chunk_size, len(pid_dataset))
+        snap_pids = pid_dataset[start:end].astype(np.int64, copy=False)
+        positions = np.searchsorted(member_pids_sorted, snap_pids, side='left')
+        in_bounds = positions < n_members
+        matched = np.zeros(len(snap_pids), dtype=bool)
+        matched[in_bounds] = member_pids_sorted[positions[in_bounds]] == snap_pids[in_bounds]
+        if not np.any(matched):
+            continue
+
+        rows = np.flatnonzero(matched).astype(np.int64, copy=False) + start
+        if not has_duplicate_member_pids:
+            row_chunks.append(rows)
+            hid_chunks.append(member_hids_sorted[positions[matched]])
+            continue
+
+        left = positions[matched].astype(np.int64, copy=False)
+        right = np.searchsorted(member_pids_sorted, snap_pids[matched], side='right').astype(np.int64, copy=False)
+        counts = right - left
+        total = int(counts.sum())
+        chunk_offsets = np.arange(total, dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)
+        member_positions = np.repeat(left, counts) + chunk_offsets
+        row_chunks.append(np.repeat(rows, counts))
+        hid_chunks.append(member_hids_sorted[member_positions])
+
+    if not row_chunks:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    return np.concatenate(row_chunks), np.concatenate(hid_chunks)
+
+
 def build_hbt_snapshot_membership_arrays(snapshot, config, subhalo_path, snap_index=None):
     """Build universal per-particle halo ancestry arrays from HBT+ output."""
     subhalo_path = Path(subhalo_path)
@@ -259,6 +318,8 @@ def build_hbt_snapshot_membership_arrays(snapshot, config, subhalo_path, snap_in
     pid_dataset = config.get('prop_aliases', {}).get('pid', 'ParticleIDs')
     width = int(tree.depths.max()) + 1 if len(tree.depths) else 1
     ancestor_arrays = build_halo_ancestor_arrays(tree, width)
+    member_hids_sorted, member_pids_sorted, has_duplicate_member_pids = _sort_hbt_memberships(member_hids, member_pids)
+    chunk_size = _hbt_particle_id_chunk_size(config)
 
     membership_arrays = {}
     counts = {ptype: 0 for ptype in config.get('ptype_names', {})}
@@ -267,23 +328,26 @@ def build_hbt_snapshot_membership_arrays(snapshot, config, subhalo_path, snap_in
         if ptype_name not in snapshot or pid_dataset not in snapshot[ptype_name]:
             continue
 
-        snap_pids = snapshot[ptype_name][pid_dataset][:].astype(np.int64, copy=False)
-        halo_id_array = np.full((len(snap_pids), width), -1, dtype=np.int32)
-        membership_arrays[ptype_name] = halo_id_array
+        snap_pid_dataset = snapshot[ptype_name][pid_dataset]
+        n_particles = len(snap_pid_dataset)
+        if len(member_pids_sorted) == 0 or n_particles == 0:
+            rows = np.empty(0, dtype=np.int64)
+            hids = np.empty(0, dtype=np.int64)
+        else:
+            rows, hids = _match_hbt_members_to_snapshot_rows(
+                snap_pid_dataset,
+                member_hids_sorted,
+                member_pids_sorted,
+                has_duplicate_member_pids,
+                chunk_size,
+            )
 
-        if len(member_pids) == 0 or len(snap_pids) == 0:
-            continue
-
-        snap_order = np.argsort(snap_pids)
-        snap_pids_sorted = snap_pids[snap_order]
-        positions = np.searchsorted(snap_pids_sorted, member_pids)
-        in_bounds = positions < len(snap_pids_sorted)
-        matched = np.zeros(len(positions), dtype=bool)
-        matched[in_bounds] = snap_pids_sorted[positions[in_bounds]] == member_pids[in_bounds]
-
-        rows = snap_order[positions[matched]]
-        hids = member_hids[matched]
-        halo_id_array[rows] = ancestor_arrays[hids]
+        membership_arrays[ptype_name] = sparse_membership_from_particle_ancestors(
+            rows,
+            hids,
+            ancestor_arrays,
+            n_particles,
+        )
         counts[ptype] = int(len(rows))
 
     print(f'  HBT particle matching: {perf_counter() - t:.1f}s', flush=True)

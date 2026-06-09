@@ -6,7 +6,11 @@ from yaml import safe_load
 from octavian.halo_reader import (
   build_snapshot_membership_arrays,
   membership_array_exclusive_ids,
+  membership_particle_count,
+  membership_selected_particles_dense,
+  membership_top_ids,
   prune_halo_tree,
+  update_rank_halo_ids_from_membership,
   write_staged_halo_tree,
 )
 
@@ -47,7 +51,7 @@ def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: d
   for ptype_name, weight_dict in [('PartType4', star_weights), ('PartType0', gas_weights), ('PartType1', dm_weights)]:
     if ptype_name not in membership_arrays:
       continue
-    top_ids = membership_arrays[ptype_name][:, 0]
+    top_ids = membership_top_ids(membership_arrays[ptype_name])
     unique, counts = np.unique(top_ids[top_ids >= 0], return_counts=True)
     for hid, count in zip(unique, counts):
       weight_dict[hid] = count
@@ -77,29 +81,31 @@ def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: d
 
   for ptype in ptypes:
     halo_id_array = membership_arrays[ptype]
-    ids = halo_id_array[:, 0]
-    halo_ids = membership_array_exclusive_ids(halo_id_array) if mode == 'subhalo' else halo_id_array[:, 0]
-    particle_index = np.arange(len(ids), dtype='int')
+    ids = membership_top_ids(halo_id_array)
+    halo_ids = membership_array_exclusive_ids(halo_id_array) if mode == 'subhalo' else ids
+    particle_index = np.arange(membership_particle_count(halo_id_array), dtype='int')
     assigned = np.zeros(len(ids), dtype=bool)
     in_lookup = (ids >= 0) & (ids < len(rank_lookup))
     assigned[in_lookup] = rank_lookup[ids[in_lookup]] >= 0
     rank_ids = rank_lookup[ids[assigned]]
+    assigned_indices = np.flatnonzero(assigned)
     datasets = [dataset for dataset in f[ptype].keys() if dataset not in ('HaloID', 'HaloID_array', 'particle_index')]
     datasets += ['HaloID', 'particle_index']
     if mode == 'subhalo':
       datasets.append('HaloID_array')
     rank_masks = [rank_ids == i for i in range(nsplit)]
 
-    staged_arrays = halo_id_array[assigned]
-    staged_halo_ids = halo_ids[assigned]
-    for i, rank_mask in enumerate(rank_masks):
-      if not np.any(rank_mask):
-        continue
-      if mode == 'subhalo':
-        values = np.unique(staged_arrays[rank_mask])
-      else:
+    rank_for_particle = np.full(len(ids), -1, dtype=np.int16)
+    rank_for_particle[assigned] = rank_ids
+    if mode == 'subhalo':
+      update_rank_halo_ids_from_membership(rank_halo_ids, halo_id_array, rank_for_particle)
+    else:
+      staged_halo_ids = halo_ids[assigned]
+      for i, rank_mask in enumerate(rank_masks):
+        if not np.any(rank_mask):
+          continue
         values = np.unique(staged_halo_ids[rank_mask])
-      rank_halo_ids[i].update(int(value) for value in values if value >= 0)
+        rank_halo_ids[i].update(int(value) for value in values if value >= 0)
 
     out_files = [h5py.File(f'{outfile}_{i}.hdf5', 'a') for i in range(nsplit)]
     try:
@@ -107,15 +113,24 @@ def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: d
         print(ptype, dataset, flush=True)
         if dataset == 'HaloID':
           data = halo_ids[assigned]
+          for i, f_out in enumerate(out_files):
+            f_out.require_group(ptype)
+            f_out[ptype][dataset] = data[rank_masks[i]]
         elif dataset == 'HaloID_array':
-          data = halo_id_array[assigned]
+          for i, f_out in enumerate(out_files):
+            f_out.require_group(ptype)
+            particle_rows = assigned_indices[rank_masks[i]]
+            f_out[ptype][dataset] = membership_selected_particles_dense(halo_id_array, particle_rows)
         elif dataset == 'particle_index':
           data = particle_index[assigned]
+          for i, f_out in enumerate(out_files):
+            f_out.require_group(ptype)
+            f_out[ptype][dataset] = data[rank_masks[i]]
         else:
           data = f[ptype][dataset][:][assigned]
-        for i, f_out in enumerate(out_files):
-          f_out.require_group(ptype)
-          f_out[ptype][dataset] = data[rank_masks[i]]
+          for i, f_out in enumerate(out_files):
+            f_out.require_group(ptype)
+            f_out[ptype][dataset] = data[rank_masks[i]]
     finally:
       for f_out in out_files:
         f_out.close()

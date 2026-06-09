@@ -23,7 +23,14 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from octavian.halo_reader.halo_utils import HaloMembership, HaloReader, HaloTree, PTYPE_ENCODE
+from octavian.halo_reader.halo_utils import (
+    HaloMembership,
+    HaloReader,
+    HaloTree,
+    PTYPE_ENCODE,
+    dense_membership_to_sparse_csc,
+    membership_array_exclusive_ids,
+)
 
 # AHF assigns ptype codes, we change these to ptype names for Octavian compatibility
 _PTYPE_MAP = {0: 0, # gas
@@ -188,12 +195,8 @@ def read_ahf_membership(particles_path, halos_path=None):
     halo_ids, parent_ids, member_hids = _remap_ahf_ids(halo_ids, parent_ids, member_hids)
     return HaloTree(halo_ids, parent_ids, properties), member_hids, member_pids, member_ptypes
 
-def _membership_array_exclusive_ids(halo_id_array: np.ndarray) -> np.ndarray:
-    out = np.full(len(halo_id_array), -1, dtype=np.int64)
-    for col in range(halo_id_array.shape[1]):
-        values = halo_id_array[:, col]
-        np.copyto(out, values, where=values >= 0)
-    return out
+def _membership_array_exclusive_ids(halo_id_array) -> np.ndarray:
+    return membership_array_exclusive_ids(halo_id_array)
 
 def _build_halo_ancestor_arrays(tree: HaloTree, width: int) -> np.ndarray:
     arrays = np.full((len(tree._id_to_idx), width), -1, dtype=np.int32)
@@ -320,6 +323,13 @@ def build_ahf_snapshot_membership_arrays(snapshot, config, particles_path, halos
     if written < 0:
         raise IOError(f'Failed to open {particles_path}')
     print(f'  AHF particle stream: {perf_counter() - t:.1f}s', flush=True)
+
+    t = perf_counter()
+    membership_arrays = {
+        ptype_name: dense_membership_to_sparse_csc(halo_id_array)
+        for ptype_name, halo_id_array in membership_arrays.items()
+    }
+    print(f'  Sparse membership conversion: {perf_counter() - t:.1f}s', flush=True)
     return tree, membership_arrays, counts
 
 

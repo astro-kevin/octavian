@@ -7,8 +7,12 @@ import h5py
 
 from octavian.halo_reader.halo_utils import (
     membership_array_exclusive_ids,
+    membership_particle_count,
+    membership_selected_particles_dense,
+    membership_top_ids,
     prune_halo_tree,
     read_staged_halo_tree,
+    update_rank_halo_ids_from_membership,
     write_staged_halo_tree,
 )
 

@@ -1,10 +1,12 @@
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 import h5py
 import unyt
 from astropy.cosmology import FlatLambdaCDM
 from sympy import sympify
 from octavian.utils import setup_logger
+from octavian.halo_reader.halo_utils import membership_top_ids
 from time import perf_counter
 
 class DataManager:
@@ -179,7 +181,7 @@ class DataManager:
     if mode == 'top':
       if ptype not in self.halo_id_arrays:
         raise KeyError(f'HaloID_array not loaded for {ptype}')
-      return self.halo_id_arrays[ptype][:, 0]
+      return membership_top_ids(self.halo_id_arrays[ptype])
     raise ValueError(f'Unsupported HaloID mode: {mode}')
 
   def get_halo_membership_rows(self, ptype: str) -> tuple[np.ndarray, np.ndarray]:
@@ -188,8 +190,12 @@ class DataManager:
     if ptype in self.halo_membership_rows:
       return self.halo_membership_rows[ptype]
     halo_id_array = self.halo_id_arrays[ptype]
-    particle_rows, array_cols = np.nonzero(halo_id_array >= 0)
-    rows = (halo_id_array[particle_rows, array_cols], particle_rows)
+    if sp.issparse(halo_id_array):
+      coo = halo_id_array.tocoo(copy=False)
+      rows = (coo.data.astype(np.int64, copy=False), coo.col)
+    else:
+      particle_rows, array_cols = np.nonzero(halo_id_array >= 0)
+      rows = (halo_id_array[particle_rows, array_cols], particle_rows)
     self.halo_membership_rows[ptype] = rows
     return rows
   

@@ -25,6 +25,7 @@ from time import perf_counter
 import h5py
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from numba import njit
 
 # the readers extract Octavian-compatible particles
@@ -70,13 +71,139 @@ def remap_halo_ids(halo_ids, parent_ids, member_hids):
     return new_halo_ids, new_parent_ids, new_member_hids
 
 
-def membership_array_exclusive_ids(halo_id_array: np.ndarray) -> np.ndarray:
-    """Return the deepest valid halo ID from each ancestry row."""
+def membership_array_exclusive_ids(halo_id_array) -> np.ndarray:
+    """Return the deepest valid halo ID for each particle."""
+    if sp.issparse(halo_id_array):
+        halo_id_array = halo_id_array.tocsc(copy=False)
+        n_particles = halo_id_array.shape[1]
+        out = np.full(n_particles, -1, dtype=np.int64)
+        nonempty = halo_id_array.indptr[1:] > halo_id_array.indptr[:-1]
+        if np.any(nonempty):
+            last = halo_id_array.indptr[1:][nonempty] - 1
+            out[np.flatnonzero(nonempty)] = halo_id_array.data[last].astype(np.int64, copy=False)
+        return out
+
     out = np.full(len(halo_id_array), -1, dtype=np.int64)
     for col in range(halo_id_array.shape[1]):
         values = halo_id_array[:, col]
         np.copyto(out, values, where=values >= 0)
     return out
+
+
+def dense_membership_to_sparse_csc(halo_id_array: np.ndarray):
+    """
+    Encode dense particle x depth membership as sparse depth x particle CSC.
+
+    Missing entries are implicit sparse zeros. Stored entries are true halo IDs, including halo 0.
+    """
+    particle_rows, depth_rows = np.nonzero(halo_id_array >= 0)
+    data = halo_id_array[particle_rows, depth_rows].astype(np.int32, copy=False) + 1
+    sparse = sp.csc_array(
+        (data, (depth_rows.astype(np.int32, copy=False), particle_rows.astype(np.int64, copy=False))),
+        shape=(halo_id_array.shape[1], halo_id_array.shape[0]),
+        dtype=np.int32,
+    )
+    sparse.data -= 1
+    return sparse
+
+
+def sparse_membership_from_particle_ancestors(
+    particle_rows: np.ndarray,
+    halo_ids: np.ndarray,
+    ancestor_arrays: np.ndarray,
+    n_particles: int,
+):
+    """Build sparse depth x particle CSC membership from matched particle rows and halo IDs."""
+    width = ancestor_arrays.shape[1]
+    if len(particle_rows) == 0:
+        return sp.csc_array((width, n_particles), dtype=np.int32)
+
+    data_chunks = []
+    depth_chunks = []
+    column_chunks = []
+    particle_rows = particle_rows.astype(np.int64, copy=False)
+    halo_ids = halo_ids.astype(np.int64, copy=False)
+    for depth in range(width):
+        values = ancestor_arrays[halo_ids, depth]
+        valid = values >= 0
+        if not np.any(valid):
+            continue
+        n_valid = int(valid.sum())
+        data_chunks.append(values[valid].astype(np.int32, copy=False) + 1)
+        depth_chunks.append(np.full(n_valid, depth, dtype=np.int32))
+        column_chunks.append(particle_rows[valid])
+
+    if not data_chunks:
+        return sp.csc_array((width, n_particles), dtype=np.int32)
+
+    sparse = sp.csc_array(
+        (np.concatenate(data_chunks), (np.concatenate(depth_chunks), np.concatenate(column_chunks))),
+        shape=(width, n_particles),
+        dtype=np.int32,
+    )
+    sparse.data -= 1
+    return sparse
+
+
+def membership_particle_count(halo_id_array) -> int:
+    return halo_id_array.shape[1] if sp.issparse(halo_id_array) else halo_id_array.shape[0]
+
+
+def membership_depth_width(halo_id_array) -> int:
+    return halo_id_array.shape[0] if sp.issparse(halo_id_array) else halo_id_array.shape[1]
+
+
+def membership_top_ids(halo_id_array) -> np.ndarray:
+    """Return a dense top-level halo ID vector aligned to particle rows."""
+    if sp.issparse(halo_id_array):
+        halo_id_array = halo_id_array.tocsc(copy=False)
+        n_particles = halo_id_array.shape[1]
+        out = np.full(n_particles, -1, dtype=np.int64)
+        starts = halo_id_array.indptr[:-1]
+        ends = halo_id_array.indptr[1:]
+        nonempty = starts < ends
+        if np.any(nonempty):
+            columns = np.flatnonzero(nonempty)
+            first = starts[nonempty]
+            has_top = halo_id_array.indices[first] == 0
+            out[columns[has_top]] = halo_id_array.data[first[has_top]].astype(np.int64, copy=False)
+        return out
+    return halo_id_array[:, 0]
+
+
+def membership_selected_particles_dense(halo_id_array, particle_indices: np.ndarray) -> np.ndarray:
+    """Return selected particles as dense particle x depth ancestry rows."""
+    particle_indices = np.asarray(particle_indices, dtype=np.int64)
+    if sp.issparse(halo_id_array):
+        if len(particle_indices) == 0:
+            return np.full((0, halo_id_array.shape[0]), -1, dtype=np.int32)
+        selected = halo_id_array.tocsc(copy=False)[:, particle_indices]
+        dense = np.full((len(particle_indices), halo_id_array.shape[0]), -1, dtype=np.int32)
+        coo = selected.tocoo(copy=False)
+        dense[coo.col, coo.row] = coo.data.astype(np.int32, copy=False)
+        return dense
+    return halo_id_array[particle_indices]
+
+
+def update_rank_halo_ids_from_membership(rank_halo_ids, halo_id_array, rank_for_particle) -> None:
+    """Update rank halo-id sets from dense or sparse membership arrays."""
+    if sp.issparse(halo_id_array):
+        coo = halo_id_array.tocoo(copy=False)
+        if coo.nnz == 0:
+            return
+        ranks = rank_for_particle[coo.col]
+        valid = ranks >= 0
+        for rank in range(len(rank_halo_ids)):
+            values = np.unique(coo.data[valid & (ranks == rank)].astype(np.int64, copy=False))
+            rank_halo_ids[rank].update(int(value) for value in values if value >= 0)
+        return
+
+    for rank in range(len(rank_halo_ids)):
+        particle_mask = rank_for_particle == rank
+        if not np.any(particle_mask):
+            continue
+        values = np.unique(halo_id_array[particle_mask])
+        rank_halo_ids[rank].update(int(value) for value in values if value >= 0)
 
 
 def build_halo_ancestor_arrays(tree: 'HaloTree', width: int) -> np.ndarray:

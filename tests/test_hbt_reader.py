@@ -12,6 +12,7 @@ from octavian.halo_reader.hbt import (
     build_hbt_snapshot_membership_arrays,
     build_parent_ids,
     gather_subsnap_files,
+    load_hbt,
     read_particles,
     read_subhalos,
 )
@@ -199,6 +200,71 @@ def test_hbt_membership_matching_scans_snapshot_ptypes_in_chunks(tmp_path):
         [0, -1],
         [-1, -1],
         [0, 1],
+    ]
+
+
+def test_hbt_membership_stream_chooses_deepest_duplicate_particle(tmp_path):
+    snapshot = tmp_path / 'snap.hdf5'
+    hbt_dir = tmp_path / '050'
+    hbt_dir.mkdir()
+    _write_snapshot(snapshot, particle_ids=[11, 12])
+    _write_subsnap(
+        hbt_dir / 'SubSnap_050.0.hdf5',
+        [
+            {'TrackId': 100, 'HostHaloId': 7, 'Rank': 0, 'NestedParentTrackId': -1},
+            {'TrackId': 101, 'HostHaloId': 7, 'Rank': 1, 'NestedParentTrackId': 100},
+        ],
+        [[11, 12], [12]],
+    )
+    config = {
+        'ptype_names': {'dm': 'PartType1'},
+        'prop_aliases': {'pid': 'ParticleIDs'},
+        'hbt_subhalo_chunk_size': 1,
+    }
+
+    with h5py.File(snapshot, 'r') as f:
+        _, membership_arrays, counts = build_hbt_snapshot_membership_arrays(f, config, hbt_dir)
+
+    assert counts == {'dm': 2}
+    assert membership_selected_particles_dense(membership_arrays['PartType1'], [0, 1]).tolist() == [
+        [0, -1],
+        [0, 1],
+    ]
+
+
+def test_load_hbt_subhalo_uses_membership_array_builder(tmp_path):
+    snapshot = tmp_path / 'snap.hdf5'
+    hbt_dir = tmp_path / '050'
+    hbt_dir.mkdir()
+    _write_snapshot(snapshot)
+    _write_subsnap(
+        hbt_dir / 'SubSnap_050.0.hdf5',
+        [
+            {'TrackId': 100, 'HostHaloId': 7, 'Rank': 0, 'NestedParentTrackId': -1},
+            {'TrackId': 101, 'HostHaloId': 7, 'Rank': 1, 'NestedParentTrackId': 100},
+        ],
+        [[11], [12]],
+    )
+    data_manager = SimpleNamespace(
+        snapfile=str(snapshot),
+        config={
+            'ptype_names': {'dm': 'PartType1'},
+            'ptypes': ['dm'],
+            'prop_aliases': {'pid': 'ParticleIDs'},
+        },
+        data={'dm': {}},
+        halo_id_arrays={},
+    )
+    data_manager.get_ptype_name = lambda ptype: data_manager.config['ptype_names'][ptype]
+
+    load_hbt(data_manager, hbt_dir, mode='subhalo')
+
+    assert data_manager.halo_tree.halo_ids.tolist() == [0, 1]
+    assert data_manager.data['dm']['HaloID'].astype(int).tolist() == [0, 1, -1]
+    assert membership_selected_particles_dense(data_manager.halo_id_arrays['dm'], [0, 1, 2]).tolist() == [
+        [0, -1],
+        [0, 1],
+        [-1, -1],
     ]
 
 

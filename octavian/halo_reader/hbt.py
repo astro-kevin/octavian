@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from octavian.halo_reader.halo_utils import (
+    HaloBuildResult,
     HaloMembership,
     HaloReader,
     HaloTree,
@@ -31,7 +32,6 @@ from octavian.halo_reader.halo_utils import (
     build_halo_ancestor_arrays,
     membership_array_exclusive_ids,
     remap_halo_ids,
-    sparse_membership_from_particle_ancestors,
 )
 
 _SUBSNAP_RE = re.compile(r'^SubSnap_(?P<snap>\d+)(?:\.(?P<file>\d+))?\.hdf5$')
@@ -251,13 +251,6 @@ def read_hbt_membership(subhalo_path, snap_index=None) -> tuple[HaloTree, np.nda
     return HaloTree(halo_ids, parent_ids, properties), member_hids, member_pids
 
 
-def _hbt_particle_id_chunk_size(config: dict) -> int:
-    chunk_size = int(config.get('hbt_particle_id_chunk_size', 20_000_000))
-    if chunk_size < 1:
-        raise ValueError('hbt_particle_id_chunk_size must be positive')
-    return chunk_size
-
-
 def _hbt_subhalo_chunk_size(config: dict) -> int:
     chunk_size = int(config.get('hbt_subhalo_chunk_size', 4096))
     if chunk_size < 1:
@@ -265,24 +258,19 @@ def _hbt_subhalo_chunk_size(config: dict) -> int:
     return chunk_size
 
 
-def _scan_max_particle_id(snapshot, config, pid_dataset: str, chunk_size: int) -> int:
-    max_pid = 0
-    for ptype_name in config.get('ptype_names', {}).values():
-        if ptype_name not in snapshot or pid_dataset not in snapshot[ptype_name]:
-            continue
-        dataset = snapshot[ptype_name][pid_dataset]
-        for start in range(0, len(dataset), chunk_size):
-            pids = dataset[start:start + chunk_size]
-            if len(pids):
-                max_pid = max(max_pid, int(pids.max()))
-    return max_pid
+def _pid_lookup_chunk_size(config: dict) -> int:
+    chunk_size = int(config.get('pid_lookup_chunk_size', 20_000_000))
+    if chunk_size < 1:
+        raise ValueError('pid_lookup_chunk_size must be positive')
+    return chunk_size
 
 
-def _build_particle_location_lookup(snapshot, config, pid_dataset: str, max_pid: int, chunk_size: int):
-    missing_row = np.iinfo(np.uint32).max
-    row_lookup = np.full(max_pid + 1, missing_row, dtype=np.uint32)
-    slot_lookup = np.full(max_pid + 1, -1, dtype=np.int8)
+def _build_particle_location_lookup(snapshot, config, pid_dataset: str):
+    max_row = np.iinfo(np.uint32).max - 1
+    entries = []
     arrays_by_slot = [None for _ in range(4)]
+    max_pid = 0
+    chunk_size = _pid_lookup_chunk_size(config)
 
     for ptype, ptype_name in config.get('ptype_names', {}).items():
         if ptype not in PTYPE_ENCODE:
@@ -293,19 +281,27 @@ def _build_particle_location_lookup(snapshot, config, pid_dataset: str, max_pid:
         slot = PTYPE_ENCODE[ptype]
         dataset = snapshot[ptype_name][pid_dataset]
         n_particles = len(dataset)
-        if n_particles >= missing_row:
+        if n_particles > max_row:
             raise ValueError(f'{ptype_name} has too many particles for uint32 row lookup')
 
-        arrays_by_slot[slot] = np.full(n_particles, -1, dtype=np.int32)
+        entries.append((slot, dataset))
+        arrays_by_slot[slot] = np.zeros(n_particles, dtype=np.int32)
+        for start in range(0, n_particles, chunk_size):
+            pids = dataset[start:start + chunk_size]
+            if len(pids):
+                max_pid = max(max_pid, int(pids.max()))
 
+    row_lookup = np.zeros(max_pid + 1, dtype=np.uint32)
+    slot_lookup = np.zeros(max_pid + 1, dtype=np.int8)
+    for slot, dataset in entries:
+        n_particles = len(dataset)
         for start in range(0, n_particles, chunk_size):
             end = min(start + chunk_size, n_particles)
             pids = dataset[start:end]
-            rows = np.arange(start, end, dtype=np.uint32)
-            row_lookup[pids] = rows
-            slot_lookup[pids] = slot
+            row_lookup[pids] = np.arange(start + 1, end + 1, dtype=np.uint32)
+            slot_lookup[pids] = slot + 1
 
-    return row_lookup, slot_lookup, arrays_by_slot
+    return max_pid, row_lookup, slot_lookup, arrays_by_slot, {}
 
 
 def _assign_hbt_candidate(
@@ -325,17 +321,17 @@ def _assign_hbt_candidate(
     if candidate_depth < 0:
         return
 
-    current_hids = best_hids[rows]
-    empty = current_hids < 0
+    current_values = best_hids[rows]
+    empty = current_values == 0
     if np.any(empty):
-        best_hids[rows[empty]] = candidate_hid
+        best_hids[rows[empty]] = candidate_hid + 1
 
     occupied = ~empty
     if not np.any(occupied):
         return
 
     occupied_rows = rows[occupied]
-    current_hids = current_hids[occupied].astype(np.int64, copy=False)
+    current_hids = current_values[occupied].astype(np.int64, copy=False) - 1
     current_depths = depth_by_halo[current_hids]
 
     current_is_ancestor = (
@@ -343,7 +339,7 @@ def _assign_hbt_candidate(
         & (ancestor_arrays[candidate_hid, current_depths] == current_hids)
     )
     if np.any(current_is_ancestor):
-        best_hids[occupied_rows[current_is_ancestor]] = candidate_hid
+        best_hids[occupied_rows[current_is_ancestor]] = candidate_hid + 1
 
     remaining = ~current_is_ancestor
     if not np.any(remaining):
@@ -369,7 +365,7 @@ def _assign_hbt_candidate(
         (candidate_depth == conflict_depths) & (candidate_hid < conflict_hids)
     )
     if np.any(replace):
-        best_hids[conflict_rows[replace]] = candidate_hid
+        best_hids[conflict_rows[replace]] = candidate_hid + 1
 
 
 def _stream_hbt_particles_into_membership_arrays(
@@ -384,7 +380,6 @@ def _stream_hbt_particles_into_membership_arrays(
     subhalo_chunk_size: int,
 ) -> np.ndarray:
     diagnostics = np.zeros(8, dtype=np.uint64)
-    missing_row = np.iinfo(np.uint32).max
     halo_offset = 0
 
     for filepath in filepaths:
@@ -414,13 +409,13 @@ def _stream_hbt_particles_into_membership_arrays(
                 lookup_hids = flat_hids[valid_pid]
                 rows = row_lookup[lookup_pids]
                 slots = slot_lookup[lookup_pids]
-                matched = (rows != missing_row) & (slots >= 0) & (lookup_hids >= 0)
+                matched = (rows != 0) & (slots > 0) & (lookup_hids >= 0)
                 diagnostics[6] += int((~matched).sum())
                 if not np.any(matched):
                     continue
 
-                rows = rows[matched].astype(np.int64, copy=False)
-                slots = slots[matched]
+                rows = rows[matched].astype(np.int64, copy=False) - 1
+                slots = slots[matched] - 1
                 lookup_hids = lookup_hids[matched]
 
                 for slot, best_hids in enumerate(arrays_by_slot):
@@ -466,16 +461,12 @@ def build_hbt_snapshot_membership_arrays(snapshot, config, subhalo_path, snap_in
     pid_dataset = config.get('prop_aliases', {}).get('pid', 'ParticleIDs')
     width = int(tree.depths.max()) + 1 if len(tree.depths) else 1
     ancestor_arrays = build_halo_ancestor_arrays(tree, width)
-    chunk_size = _hbt_particle_id_chunk_size(config)
 
     t = perf_counter()
-    max_pid = _scan_max_particle_id(snapshot, config, pid_dataset, chunk_size)
-    row_lookup, slot_lookup, arrays_by_slot = _build_particle_location_lookup(
+    max_pid, row_lookup, slot_lookup, arrays_by_slot, cached_datasets = _build_particle_location_lookup(
         snapshot,
         config,
         pid_dataset,
-        max_pid,
-        chunk_size,
     )
     print(f'  Particle ID location lookup: {perf_counter() - t:.1f}s', flush=True)
 
@@ -504,27 +495,20 @@ def build_hbt_snapshot_membership_arrays(snapshot, config, subhalo_path, snap_in
         if ptype not in PTYPE_ENCODE:
             continue
         slot = PTYPE_ENCODE[ptype]
-        best_hids = arrays_by_slot[slot]
-        if best_hids is None:
+        membership = arrays_by_slot[slot]
+        if membership is None:
             continue
-        rows = np.flatnonzero(best_hids >= 0).astype(np.int64, copy=False)
-        hids = best_hids[rows].astype(np.int64, copy=False)
-        membership_arrays[ptype_name] = sparse_membership_from_particle_ancestors(
-            rows,
-            hids,
-            ancestor_arrays,
-            len(best_hids),
-        )
-        counts[ptype] = int(len(rows))
+        membership_arrays[ptype_name] = membership
+        counts[ptype] = int(np.count_nonzero(membership))
 
-    print(f'  Sparse membership conversion: {perf_counter() - t:.1f}s', flush=True)
+    print(f'  Scalar membership finalize: {perf_counter() - t:.1f}s', flush=True)
     if diagnostics[5] or diagnostics[6] or diagnostics[7]:
         print(
             f'  HBT stream skipped: out_of_range={int(diagnostics[5])}, '
             f'unmatched={int(diagnostics[6])}, conflicts={int(diagnostics[7])}',
             flush=True,
         )
-    return tree, membership_arrays, counts
+    return HaloBuildResult(tree, membership_arrays, counts, cached_datasets, ancestor_arrays=ancestor_arrays)
 
 
 def build_parent_ids(properties) -> np.ndarray:
@@ -680,21 +664,29 @@ def load_hbt(data_manager: DataManager, subhalo_path: str, snap_index: int | Non
 
     if mode == 'subhalo':
         with h5py.File(data_manager.snapfile, 'r') as f:
-            tree, membership_arrays, counts = build_hbt_snapshot_membership_arrays(
+            build_result = build_hbt_snapshot_membership_arrays(
                 f,
                 data_manager.config,
                 subhalo_path,
                 snap_index,
             )
+            tree, membership_arrays, counts = build_result
+        ancestor_arrays = build_result.ancestor_arrays
         data_manager.halo_tree = tree
         for ptype in data_manager.config['ptypes']:
             ptype_name = data_manager.get_ptype_name(ptype)
             if ptype_name not in membership_arrays:
                 continue
-            halo_id_array = membership_arrays[ptype_name]
-            data_manager.halo_id_arrays[ptype] = halo_id_array
+            membership = membership_arrays[ptype_name]
+            data_manager.halo_id_arrays[ptype] = (
+                ancestor_arrays[np.maximum(membership.astype(np.int64, copy=False) - 1, 0)]
+                if ancestor_arrays is not None else membership
+            )
+            missing = membership == 0
+            if ancestor_arrays is not None and np.any(missing):
+                data_manager.halo_id_arrays[ptype][missing] = -1
             data_manager.data[ptype]['HaloID'] = pd.Series(
-                membership_array_exclusive_ids(halo_id_array),
+                membership_array_exclusive_ids(membership),
                 dtype='category',
             )
         count_text = ', '.join(f'{ptype}={count}' for ptype, count in counts.items())

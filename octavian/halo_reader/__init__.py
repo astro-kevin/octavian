@@ -6,6 +6,7 @@ from types import ModuleType
 import h5py
 
 from octavian.halo_reader.halo_utils import (
+    HaloBuildResult,
     membership_array_exclusive_ids,
     membership_depth_width,
     membership_particle_count,

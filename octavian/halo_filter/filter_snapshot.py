@@ -5,12 +5,7 @@ from yaml import safe_load
 
 from octavian.halo_reader import (
   build_snapshot_membership_arrays,
-  membership_depth_width,
-  membership_particle_count,
-  membership_rank_ids,
-  membership_selected_exclusive_ids,
-  membership_selected_particles_dense,
-  membership_selected_top_ids,
+  membership_array_exclusive_ids,
   membership_top_id_counts,
   prune_halo_tree,
   write_staged_halo_tree,
@@ -52,203 +47,323 @@ def _rank_dtype(nsplit: int):
 
 
 
-def _chunk_rows_for_row_bytes(n_rows: int, row_bytes: int, config: dict) -> int:
-  configured_rows = config.get('staging_property_chunk_rows', config.get('staging_chunk_rows'))
-  if configured_rows is not None:
-    chunk_rows = int(configured_rows)
-    if chunk_rows < 1:
-      raise ValueError('staging_property_chunk_rows must be positive')
-    return min(n_rows, chunk_rows)
+def _dense_rank_ids(top_ids: np.ndarray, rank_lookup: np.ndarray, dtype) -> np.ndarray:
+  rank_ids = np.full(len(top_ids), -1, dtype=dtype)
+  if len(rank_lookup) == 0 or len(top_ids) == 0:
+    return rank_ids
 
-  target_bytes = int(config.get('staging_property_chunk_bytes', 256 * 1024**2))
-  max_rows = int(config.get('staging_property_chunk_max_rows', 20_000_000))
-  if target_bytes < 1:
-    raise ValueError('staging_property_chunk_bytes must be positive')
-  if max_rows < 1:
-    raise ValueError('staging_property_chunk_max_rows must be positive')
-
-  row_bytes = max(int(row_bytes), 1)
-  return max(1, min(n_rows, max_rows, target_bytes // row_bytes))
+  valid = (top_ids >= 0) & (top_ids < len(rank_lookup))
+  if np.any(valid):
+    rank_ids[valid] = rank_lookup[top_ids[valid]]
+  return rank_ids
 
 
-
-def _output_chunk_shape(shape_tail: tuple, dtype, input_chunk_rows: int, config: dict) -> tuple:
-  shape_tail = tuple(int(axis) for axis in shape_tail)
-  row_elements = int(np.prod(shape_tail, dtype=np.int64)) if shape_tail else 1
-  row_bytes = max(np.dtype(dtype).itemsize * row_elements, 1)
-  target_bytes = int(config.get('staging_output_chunk_bytes', 16 * 1024**2))
-  rows = max(1, min(int(input_chunk_rows), max(1, target_bytes // row_bytes)))
-  return (rows,) + shape_tail
+def _rows_by_rank(rank_ids: np.ndarray, nsplit: int) -> list[np.ndarray]:
+  return [np.flatnonzero(rank_ids == rank).astype(np.uint32, copy=False) for rank in range(nsplit)]
 
 
-def _create_extendible_dataset(group, name: str, shape_tail: tuple, dtype, input_chunk_rows: int, config: dict):
-  shape_tail = tuple(int(axis) for axis in shape_tail)
+def _write_dataset(group, name: str, values) -> None:
   if name in group:
     del group[name]
-  return group.create_dataset(
-    name,
-    shape=(0,) + shape_tail,
-    maxshape=(None,) + shape_tail,
-    chunks=_output_chunk_shape(shape_tail, dtype, input_chunk_rows, config),
-    dtype=dtype,
-  )
+  group.create_dataset(name, data=values)
 
 
-def _create_extendible_outputs(groups, name: str, shape_tail: tuple, dtype, input_chunk_rows: int, config: dict) -> list:
-  return [_create_extendible_dataset(group, name, shape_tail, dtype, input_chunk_rows, config) for group in groups]
+def _source_dataset_offset(dataset) -> int:
+  try:
+    offset = dataset.id.get_offset()
+  except Exception:
+    offset = None
+  if offset is None or offset < 0:
+    return np.iinfo(np.int64).max
+  return int(offset)
 
 
-def _append_values(dataset, values) -> None:
-  n_write = len(values)
-  if n_write == 0:
-    return
-  old_size = len(dataset)
-  new_size = old_size + n_write
-  dataset.resize((new_size,) + dataset.shape[1:])
-  dataset[old_size:new_size] = values
+_STAGING_REQUIRED_PROPS = {
+  'gas': ('pid', 'pos', 'vel', 'mass', 'potential', 'rho', 'nh', 'fH2', 'metallicity', 'sfr', 'temperature', 'dustmass'),
+  'dm': ('pid', 'pos', 'vel', 'mass', 'potential'),
+  'star': ('pid', 'pos', 'vel', 'mass', 'potential', 'age', 'metallicity'),
+  'bh': ('pid', 'pos', 'vel', 'bhmass', 'potential', 'bhmdot'),
+}
 
 
-def _append_chunk_values_by_rank(outputs: list, values, rows_by_rank: list[np.ndarray]) -> None:
+def _logical_ptype_for_group(config: dict, ptype_name: str) -> str | None:
+  for logical_ptype, configured_name in config.get('ptype_names', {}).items():
+    if configured_name == ptype_name:
+      return logical_ptype
+  return None
+
+
+def _required_source_dataset_names(config: dict, ptype_name: str) -> set[str]:
+  logical_ptype = _logical_ptype_for_group(config, ptype_name)
+  if logical_ptype is None:
+    return set()
+
+  prop_aliases = config.get('prop_aliases', {})
+  names = set()
+  for prop in _STAGING_REQUIRED_PROPS.get(logical_ptype, ()):
+    name = prop_aliases.get(prop)
+    if name is not None:
+      names.add(name)
+
+  for prop in config.get('staging_properties', {}).get('all', ()):
+    name = prop_aliases.get(prop, prop)
+    if name is not None:
+      names.add(name)
+  for prop in config.get('staging_properties', {}).get(logical_ptype, ()):
+    name = prop_aliases.get(prop, prop)
+    if name is not None:
+      names.add(name)
+
+  return names
+
+
+def _source_dataset_names(group, config: dict, ptype_name: str) -> list[str]:
+  excluded = {'HaloID', 'HaloID_array', 'particle_index'}
+  required = _required_source_dataset_names(config, ptype_name)
+  names = [name for name in group.keys() if name not in excluded and name in required]
+  return sorted(names, key=lambda name: (_source_dataset_offset(group[name]), name))
+
+
+def _write_ranked_values(groups: list, name: str, data, rows_by_rank: list[np.ndarray]) -> float:
+  t = perf_counter()
   for rank, rows in enumerate(rows_by_rank):
-    if len(rows) == 0:
-      continue
-    _append_values(outputs[rank], values[rows])
+    _write_dataset(groups[rank], name, data[rows])
+  return perf_counter() - t
 
 
-def _append_selected_values_by_rank(outputs: list, values, selected_positions_by_rank: list[np.ndarray]) -> None:
-  for rank, positions in enumerate(selected_positions_by_rank):
-    if len(positions) == 0:
-      continue
-    _append_values(outputs[rank], values[positions])
+def _read_staging_source_dataset(dataset, name: str, config: dict):
+  metallicity_name = config.get('prop_aliases', {}).get('metallicity')
+  if name == metallicity_name and getattr(dataset, 'ndim', 1) > 1:
+    return dataset[:, 0:1]
+  return dataset[:]
 
 
-def _source_dataset_row_bytes(dataset) -> int:
-  row_shape = dataset.shape[1:]
-  row_elements = int(np.prod(row_shape, dtype=np.int64)) if row_shape else 1
-  return dataset.dtype.itemsize * row_elements
+def _is_scalar_membership(membership) -> bool:
+  return isinstance(membership, np.ndarray) and membership.ndim == 1
 
 
-def _staging_chunk_rows(n_particles: int, source_datasets: list, halo_id_array, mode: str, config: dict) -> int:
-  row_bytes = np.dtype(np.int64).itemsize  # particle_index
-  row_bytes += np.dtype(np.int64).itemsize  # HaloID
-  if mode == 'subhalo':
-    row_bytes += membership_depth_width(halo_id_array) * np.dtype(np.int32).itemsize
-  for dataset in source_datasets:
-    row_bytes += _source_dataset_row_bytes(dataset)
-  return _chunk_rows_for_row_bytes(n_particles, row_bytes, config)
+def _membership_top_id_counts_for_weights(membership, ancestor_arrays) -> tuple[np.ndarray, np.ndarray]:
+  if _is_scalar_membership(membership):
+    if ancestor_arrays is None:
+      raise ValueError('ancestor_arrays is required for scalar halo memberships')
+    encoded = membership[membership > 0]
+    if len(encoded) == 0:
+      return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    exclusive = encoded.astype(np.int64, copy=False) - 1
+    values = ancestor_arrays[exclusive, 0].astype(np.int64, copy=False)
+    values = values[values >= 0]
+    if len(values) == 0:
+      return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    return np.unique(values, return_counts=True)
+  return membership_top_id_counts(membership)
 
 
-def _chunk_rank_rows(rank_ids: np.ndarray, start: int, end: int, nsplit: int):
-  rank_chunk = rank_ids[start:end]
-  selected_rows = np.flatnonzero(rank_chunk >= 0).astype(np.int32, copy=False)
-  if len(selected_rows) == 0:
-    empty = [np.empty(0, dtype=np.int32) for _ in range(nsplit)]
-    return selected_rows, empty, empty
+def _scalar_rows_by_rank(membership: np.ndarray, ancestor_arrays: np.ndarray, rank_lookup: np.ndarray, nsplit: int):
+  rows = np.flatnonzero(membership > 0).astype(np.uint32, copy=False)
+  if len(rows) == 0:
+    return [np.empty(0, dtype=np.uint32) for _ in range(nsplit)], [np.empty(0, dtype=np.int64) for _ in range(nsplit)]
 
-  selected_ranks = rank_chunk[selected_rows]
-  selected_positions_by_rank = [
-    np.flatnonzero(selected_ranks == rank).astype(np.int32, copy=False)
-    for rank in range(nsplit)
-  ]
-  rows_by_rank = [selected_rows[positions] for positions in selected_positions_by_rank]
-  return selected_rows, rows_by_rank, selected_positions_by_rank
+  exclusive = membership[rows].astype(np.int64, copy=False) - 1
+  top_ids = ancestor_arrays[exclusive, 0].astype(np.int64, copy=False)
+  valid = (top_ids >= 0) & (top_ids < len(rank_lookup))
+  if not np.any(valid):
+    return [np.empty(0, dtype=np.uint32) for _ in range(nsplit)], [np.empty(0, dtype=np.int64) for _ in range(nsplit)]
+
+  rows = rows[valid]
+  exclusive = exclusive[valid]
+  ranks = rank_lookup[top_ids[valid]]
+  assigned = ranks >= 0
+  rows = rows[assigned]
+  exclusive = exclusive[assigned]
+  ranks = ranks[assigned]
+
+  rows_by_rank = []
+  exclusive_by_rank = []
+  for rank in range(nsplit):
+    mask = ranks == rank
+    rows_by_rank.append(rows[mask].astype(np.uint32, copy=False))
+    exclusive_by_rank.append(exclusive[mask].astype(np.int64, copy=False))
+  return rows_by_rank, exclusive_by_rank
 
 
-def _stage_ptype_by_row_chunks(
+def _stage_ptype_scalar(
   f: h5py.File,
   ptype: str,
   groups: list,
-  halo_id_array,
-  rank_ids: np.ndarray,
-  config: dict,
+  membership: np.ndarray,
+  ancestor_arrays: np.ndarray,
+  rank_lookup: np.ndarray,
   nsplit: int,
   mode: str,
   rank_halo_ids: list[set[int]],
+  cached_datasets: dict[str, dict[str, np.ndarray]],
+  source_reads: set[tuple[str, str]],
+  config: dict,
 ) -> None:
-  n_particles = membership_particle_count(halo_id_array)
-  source_names = [dataset for dataset in f[ptype].keys() if dataset not in ('HaloID', 'HaloID_array', 'particle_index')]
-  source_specs = []
+  n_particles = len(membership)
+  source_names = _source_dataset_names(f[ptype], config, ptype)
+  ptype_cache = cached_datasets.get(ptype, {})
   for name in source_names:
-    dataset = f[ptype][name]
-    if len(dataset) != n_particles:
-      raise ValueError(f'{ptype}/{name} has {len(dataset)} rows but expected {n_particles}')
-    source_specs.append((name, dataset))
+    if len(f[ptype][name]) != n_particles:
+      raise ValueError(f'{ptype}/{name} has {len(f[ptype][name])} rows but expected {n_particles}')
 
-  source_datasets = [dataset for _, dataset in source_specs]
-  chunk_rows = _staging_chunk_rows(n_particles, source_datasets, halo_id_array, mode, config)
-  print(f'{ptype} staging chunk_rows={chunk_rows} datasets={len(source_specs)}', flush=True)
+  rows_by_rank, exclusive_by_rank = _scalar_rows_by_rank(membership, ancestor_arrays, rank_lookup, nsplit)
+  selected = sum(len(rows) for rows in rows_by_rank)
+  print(f'{ptype} staging selected={selected} datasets={len(source_names)}', flush=True)
 
-  source_outputs = {
-    name: _create_extendible_outputs(groups, name, dataset.shape[1:], dataset.dtype, chunk_rows, config)
-    for name, dataset in source_specs
-  }
-  halo_outputs = _create_extendible_outputs(groups, 'HaloID', (), np.int64, chunk_rows, config)
-  particle_index_outputs = _create_extendible_outputs(groups, 'particle_index', (), np.int64, chunk_rows, config)
-  halo_array_outputs = None
-  if mode == 'subhalo':
-    halo_array_outputs = _create_extendible_outputs(groups, 'HaloID_array', (membership_depth_width(halo_id_array),), np.int32, chunk_rows, config)
-
-  halo_selector = membership_selected_exclusive_ids if mode == 'subhalo' else membership_selected_top_ids
-  timings = {name: 0.0 for name, _ in source_specs}
-  timings['HaloID'] = 0.0
-  timings['particle_index'] = 0.0
-  if mode == 'subhalo':
-    timings['HaloID_array'] = 0.0
-  routing_time = 0.0
-
-  for start in range(0, n_particles, chunk_rows):
-    end = min(start + chunk_rows, n_particles)
-    t = perf_counter()
-    selected_rows, rows_by_rank, selected_positions_by_rank = _chunk_rank_rows(rank_ids, start, end, nsplit)
-    routing_time += perf_counter() - t
-    if len(selected_rows) == 0:
+  for rank, exclusive in enumerate(exclusive_by_rank):
+    if len(exclusive) == 0:
       continue
+    rank_halo_ids[rank].update(int(value) for value in np.unique(exclusive) if value >= 0)
 
-    global_rows = selected_rows.astype(np.int64, copy=False) + start
+  timings = {}
 
+  cached_names = [name for name in source_names if name in ptype_cache]
+  hdf5_names = [name for name in source_names if name not in ptype_cache]
+
+  for name in cached_names:
     t = perf_counter()
-    halo_values = halo_selector(halo_id_array, global_rows)
-    _append_selected_values_by_rank(halo_outputs, halo_values, selected_positions_by_rank)
-    for rank, positions in enumerate(selected_positions_by_rank):
-      if len(positions):
-        rank_values = halo_values[positions]
-        rank_halo_ids[rank].update(int(value) for value in np.unique(rank_values) if value >= 0)
-    timings['HaloID'] += perf_counter() - t
+    data = ptype_cache.pop(name)
+    read_time = perf_counter() - t
+    write_time = _write_ranked_values(groups, name, data, rows_by_rank)
+    timings[name] = read_time + write_time
+    print(f'{ptype} {name}: read={read_time:.1f}s write={write_time:.1f}s source=cached', flush=True)
+    del data
 
-    if halo_array_outputs is not None:
-      t = perf_counter()
-      halo_array_values = membership_selected_particles_dense(halo_id_array, global_rows)
-      _append_selected_values_by_rank(halo_array_outputs, halo_array_values, selected_positions_by_rank)
-      timings['HaloID_array'] += perf_counter() - t
-
+  for name in hdf5_names:
+    key = (ptype, name)
+    if key in source_reads:
+      raise RuntimeError(f'{ptype}/{name} would be read from the source snapshot more than once')
+    source_reads.add(key)
     t = perf_counter()
-    for rank, rows in enumerate(rows_by_rank):
-      if len(rows) == 0:
-        continue
-      _append_values(particle_index_outputs[rank], rows.astype(np.int64, copy=False) + start)
-    timings['particle_index'] += perf_counter() - t
+    data = _read_staging_source_dataset(f[ptype][name], name, config)
+    read_time = perf_counter() - t
+    write_time = _write_ranked_values(groups, name, data, rows_by_rank)
+    timings[name] = read_time + write_time
+    print(f'{ptype} {name}: read={read_time:.1f}s write={write_time:.1f}s source=hdf5', flush=True)
+    del data
 
-    for name, dataset in source_specs:
-      t = perf_counter()
-      data_chunk = dataset[start:end]
-      _append_chunk_values_by_rank(source_outputs[name], data_chunk, rows_by_rank)
-      timings[name] += perf_counter() - t
+  t = perf_counter()
+  for rank, exclusive in enumerate(exclusive_by_rank):
+    if mode == 'subhalo':
+      halo_ids = exclusive
+    else:
+      halo_ids = ancestor_arrays[exclusive, 0].astype(np.int64, copy=False) if len(exclusive) else exclusive
+    _write_dataset(groups[rank], 'HaloID', halo_ids)
+  timings['HaloID'] = perf_counter() - t
 
-  print(f'{ptype} routing: {routing_time:.1f}s', flush=True)
-  for name in list(source_outputs) + ['HaloID', 'particle_index'] + (['HaloID_array'] if mode == 'subhalo' else []):
+  t = perf_counter()
+  for rank, rows in enumerate(rows_by_rank):
+    _write_dataset(groups[rank], 'particle_index', rows.astype(np.int64, copy=False))
+  timings['particle_index'] = perf_counter() - t
+
+  if mode == 'subhalo':
+    t = perf_counter()
+    for rank, exclusive in enumerate(exclusive_by_rank):
+      values = ancestor_arrays[exclusive] if len(exclusive) else np.empty((0, ancestor_arrays.shape[1]), dtype=np.int32)
+      _write_dataset(groups[rank], 'HaloID_array', values)
+    timings['HaloID_array'] = perf_counter() - t
+
+  for name in ['HaloID', 'particle_index'] + (['HaloID_array'] if mode == 'subhalo' else []):
     print(f'{ptype} {name}: {timings[name]:.1f}s', flush=True)
 
-def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: dict, nsplit: int, membership_arrays: dict[str, np.ndarray], mode: str, tree=None):
+
+def _stage_ptype_dense(
+  f: h5py.File,
+  ptype: str,
+  groups: list,
+  halo_id_array: np.ndarray,
+  rank_lookup: np.ndarray,
+  rank_dtype,
+  nsplit: int,
+  mode: str,
+  rank_halo_ids: list[set[int]],
+  cached_datasets: dict[str, dict[str, np.ndarray]],
+  source_reads: set[tuple[str, str]],
+  config: dict,
+  ancestor_arrays: np.ndarray | None = None,
+) -> None:
+  if _is_scalar_membership(halo_id_array):
+    if ancestor_arrays is None:
+      raise ValueError('ancestor_arrays is required for scalar halo memberships')
+    _stage_ptype_scalar(f, ptype, groups, halo_id_array, ancestor_arrays, rank_lookup, nsplit, mode, rank_halo_ids, cached_datasets, source_reads, config)
+    return
+
+  n_particles = len(halo_id_array)
+  source_names = _source_dataset_names(f[ptype], config, ptype)
+  ptype_cache = cached_datasets.get(ptype, {})
+  for name in source_names:
+    if len(f[ptype][name]) != n_particles:
+      raise ValueError(f'{ptype}/{name} has {len(f[ptype][name])} rows but expected {n_particles}')
+
+  top_ids = halo_id_array[:, 0]
+  rank_ids = _dense_rank_ids(top_ids, rank_lookup, rank_dtype)
+  rows_by_rank = _rows_by_rank(rank_ids, nsplit)
+  selected = sum(len(rows) for rows in rows_by_rank)
+  print(f'{ptype} staging selected={selected} datasets={len(source_names)}', flush=True)
+
+  halo_ids = membership_array_exclusive_ids(halo_id_array) if mode == 'subhalo' else top_ids.astype(np.int64, copy=False)
+  for rank, rows in enumerate(rows_by_rank):
+    if len(rows) == 0:
+      continue
+    values = np.unique(halo_ids[rows])
+    rank_halo_ids[rank].update(int(value) for value in values if value >= 0)
+
+  timings = {}
+  t = perf_counter()
+  for rank, rows in enumerate(rows_by_rank):
+    _write_dataset(groups[rank], 'HaloID', halo_ids[rows])
+  timings['HaloID'] = perf_counter() - t
+
+  t = perf_counter()
+  for rank, rows in enumerate(rows_by_rank):
+    _write_dataset(groups[rank], 'particle_index', rows.astype(np.int64, copy=False))
+  timings['particle_index'] = perf_counter() - t
+
+  if mode == 'subhalo':
+    timings['HaloID_array'] = _write_ranked_values(groups, 'HaloID_array', halo_id_array, rows_by_rank)
+
+  del halo_ids, top_ids, rank_ids, halo_id_array
+
+  cached_names = [name for name in source_names if name in ptype_cache]
+  hdf5_names = [name for name in source_names if name not in ptype_cache]
+
+  for name in cached_names:
+    t = perf_counter()
+    data = ptype_cache.pop(name)
+    read_time = perf_counter() - t
+    write_time = _write_ranked_values(groups, name, data, rows_by_rank)
+    timings[name] = read_time + write_time
+    print(f'{ptype} {name}: read={read_time:.1f}s write={write_time:.1f}s source=cached', flush=True)
+    del data
+
+  for name in hdf5_names:
+    key = (ptype, name)
+    if key in source_reads:
+      raise RuntimeError(f'{ptype}/{name} would be read from the source snapshot more than once')
+    source_reads.add(key)
+    t = perf_counter()
+    data = _read_staging_source_dataset(f[ptype][name], name, config)
+    read_time = perf_counter() - t
+    write_time = _write_ranked_values(groups, name, data, rows_by_rank)
+    timings[name] = read_time + write_time
+    print(f'{ptype} {name}: read={read_time:.1f}s write={write_time:.1f}s source=hdf5', flush=True)
+    del data
+
+  for name in ['HaloID', 'particle_index'] + (['HaloID_array'] if mode == 'subhalo' else []):
+    print(f'{ptype} {name}: {timings[name]:.1f}s', flush=True)
+
+def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: dict, nsplit: int, membership_arrays: dict[str, np.ndarray], mode: str, tree=None, cached_datasets=None, ancestor_arrays=None):
   for i in range(nsplit):
     with h5py.File(f'{outfile}_{i}.hdf5', 'a') as f_out:
       f.copy(f['Header'], f_out, 'Header')
 
-  ptypes = list(membership_arrays)
+  ptypes = sorted(membership_arrays, key=lambda ptype: membership_arrays[ptype].nbytes, reverse=True)
   star_weights, gas_weights, dm_weights = {}, {}, {}
   for ptype_name, weight_dict in [('PartType4', star_weights), ('PartType0', gas_weights), ('PartType1', dm_weights)]:
     if ptype_name not in membership_arrays:
       continue
-    unique, counts = membership_top_id_counts(membership_arrays[ptype_name])
+    unique, counts = _membership_top_id_counts_for_weights(membership_arrays[ptype_name], ancestor_arrays)
     for hid, count in zip(unique, counts):
       weight_dict[int(hid)] = int(count)
 
@@ -276,19 +391,19 @@ def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: d
 
   rank_halo_ids = [set() for _ in range(nsplit)]
 
+  cached_datasets = cached_datasets or {}
+  source_reads = set()
+
   for ptype in ptypes:
-    halo_id_array = membership_arrays[ptype]
-    rank_ids = membership_rank_ids(halo_id_array, rank_lookup, dtype=rank_dtype)
+    halo_id_array = membership_arrays.pop(ptype)
 
     out_files = [h5py.File(f'{outfile}_{i}.hdf5', 'a') for i in range(nsplit)]
     try:
       groups = [f_out.require_group(ptype) for f_out in out_files]
-      _stage_ptype_by_row_chunks(f, ptype, groups, halo_id_array, rank_ids, config, nsplit, mode, rank_halo_ids)
+      _stage_ptype_dense(f, ptype, groups, halo_id_array, rank_lookup, rank_dtype, nsplit, mode, rank_halo_ids, cached_datasets, source_reads, config, ancestor_arrays=ancestor_arrays)
     finally:
       for f_out in out_files:
         f_out.close()
-
-    del rank_ids
 
   if tree is not None:
     for i, halo_ids_in_rank in enumerate(rank_halo_ids):
@@ -318,7 +433,10 @@ def filter_snapshot(snapfile: str, outfile: str, configfile: str, nsplit: int=4)
     if halo_source:
       t = perf_counter()
       print(f'Building {halo_source.upper()} HaloID arrays...', flush=True)
-      tree, membership_arrays, counts = build_snapshot_membership_arrays(f, config)
+      build_result = build_snapshot_membership_arrays(f, config)
+      tree, membership_arrays, counts = build_result
+      cached_datasets = getattr(build_result, 'cached_datasets', {})
+      ancestor_arrays = getattr(build_result, 'ancestor_arrays', None)
       print(f'  Built {halo_source.upper()} membership arrays: {perf_counter() - t:.1f}s', flush=True)
       if isinstance(counts, np.ndarray):
         print(f'  {halo_source.upper()} memberships written: {int(counts[:4].sum())}, conflicts resolved: {int(counts[7])}', flush=True)
@@ -326,7 +444,7 @@ def filter_snapshot(snapfile: str, outfile: str, configfile: str, nsplit: int=4)
         count_text = ', '.join(f'{ptype}={count}' for ptype, count in counts.items())
         print(f'  {halo_source.upper()} memberships written: {count_text}', flush=True)
       t = perf_counter()
-      filter_snapshot_with_membership_arrays(f, outfile, config, nsplit, membership_arrays, halo_mode, tree=tree)
+      filter_snapshot_with_membership_arrays(f, outfile, config, nsplit, membership_arrays, halo_mode, tree=tree, cached_datasets=cached_datasets, ancestor_arrays=ancestor_arrays)
       print(f'  Wrote split snapshots: {perf_counter() - t:.1f}s', flush=True)
       return
 

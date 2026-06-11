@@ -24,11 +24,11 @@ import numpy as np
 import pandas as pd
 
 from octavian.halo_reader.halo_utils import (
+    HaloBuildResult,
     HaloMembership,
     HaloReader,
     HaloTree,
     PTYPE_ENCODE,
-    dense_membership_to_sparse_csc,
     membership_array_exclusive_ids,
 )
 
@@ -224,43 +224,56 @@ def _load_ahf_parser():
         raise FileNotFoundError(f'Compiled parser not found at {so_path}. Compile with: gcc -O2 -shared -fPIC -o ahf_parser.so ahf_parser.c')
     return ctypes.CDLL(str(so_path))
 
-def _scan_max_particle_id(snapshot, config, pid_dataset, chunk_size=20_000_000):
-    max_pid = 0
-    for ptype_name in config['ptype_names'].values():
-        if ptype_name not in snapshot:
-            continue
-        dataset = snapshot[ptype_name][pid_dataset]
-        for start in range(0, len(dataset), chunk_size):
-            pids = dataset[start:start + chunk_size]
-            if len(pids):
-                max_pid = max(max_pid, int(pids.max()))
-    return max_pid
+def _pid_lookup_chunk_size(config: dict) -> int:
+    chunk_size = int(config.get('pid_lookup_chunk_size', 20_000_000))
+    if chunk_size < 1:
+        raise ValueError('pid_lookup_chunk_size must be positive')
+    return chunk_size
 
-def _build_particle_lookups(snapshot, config, pid_dataset, max_pid, chunk_size=20_000_000):
-    sentinel = np.iinfo(np.uint32).max
-    lookups = [np.full(max_pid + 1, sentinel, dtype=np.uint32) for _ in range(4)]
+
+def _build_particle_location_lookup(snapshot, config, pid_dataset):
+    max_row = np.iinfo(np.uint32).max - 1
+    entries = []
+    max_pid = 0
+    chunk_size = _pid_lookup_chunk_size(config)
+
     for ptype, ptype_name in config['ptype_names'].items():
-        if ptype_name not in snapshot:
+        if ptype not in PTYPE_ENCODE:
+            continue
+        if ptype_name not in snapshot or pid_dataset not in snapshot[ptype_name]:
             continue
         slot = PTYPE_ENCODE[ptype]
         dataset = snapshot[ptype_name][pid_dataset]
-        if len(dataset) >= sentinel:
+        n_particles = len(dataset)
+        if n_particles > max_row:
             raise ValueError(f'{ptype_name} has too many particles for uint32 row lookup')
-        for start in range(0, len(dataset), chunk_size):
-            end = min(start + chunk_size, len(dataset))
-            pids = dataset[start:end]
-            lookups[slot][pids] = np.arange(start, end, dtype=np.uint32)
-    return lookups
+        entries.append((slot, dataset))
+        for start in range(0, n_particles, chunk_size):
+            pids = dataset[start:start + chunk_size]
+            if len(pids):
+                max_pid = max(max_pid, int(pids.max()))
 
-def _allocate_membership_arrays(snapshot, config, pid_dataset, width):
+    row_lookup = np.zeros(max_pid + 1, dtype=np.uint32)
+    slot_lookup = np.zeros(max_pid + 1, dtype=np.int8)
+    for slot, dataset in entries:
+        n_particles = len(dataset)
+        for start in range(0, n_particles, chunk_size):
+            end = min(start + chunk_size, n_particles)
+            pids = dataset[start:end]
+            row_lookup[pids] = np.arange(start + 1, end + 1, dtype=np.uint32)
+            slot_lookup[pids] = slot + 1
+
+    return max_pid, row_lookup, slot_lookup, {}
+
+def _allocate_membership_arrays(snapshot, config, pid_dataset):
     membership_arrays = {}
-    by_slot = [np.empty((0, width), dtype=np.int32) for _ in range(4)]
+    by_slot = [np.empty(0, dtype=np.int32) for _ in range(4)]
     for ptype, ptype_name in config['ptype_names'].items():
         if ptype_name not in snapshot:
             continue
-        halo_id_array = np.full((len(snapshot[ptype_name][pid_dataset]), width), -1, dtype=np.int32)
-        membership_arrays[ptype_name] = halo_id_array
-        by_slot[PTYPE_ENCODE[ptype]] = halo_id_array
+        membership = np.zeros(len(snapshot[ptype_name][pid_dataset]), dtype=np.int32)
+        membership_arrays[ptype_name] = membership
+        by_slot[PTYPE_ENCODE[ptype]] = membership
     return membership_arrays, by_slot
 
 def build_ahf_snapshot_membership_arrays(snapshot, config, particles_path, halos_path=None):
@@ -275,26 +288,28 @@ def build_ahf_snapshot_membership_arrays(snapshot, config, particles_path, halos
     ancestor_arrays = _build_halo_ancestor_arrays(tree, width)
 
     t = perf_counter()
-    max_pid = _scan_max_particle_id(snapshot, config, pid_dataset)
-    lookups = _build_particle_lookups(snapshot, config, pid_dataset, max_pid)
+    max_pid, row_lookup, slot_lookup, cached_datasets = _build_particle_location_lookup(snapshot, config, pid_dataset)
     print(f'  Particle ID lookups: {perf_counter() - t:.1f}s', flush=True)
     t = perf_counter()
-    membership_arrays, arrays_by_slot = _allocate_membership_arrays(snapshot, config, pid_dataset, width)
-    print(f'  Membership array allocation: {perf_counter() - t:.1f}s', flush=True)
+    membership_arrays, arrays_by_slot = _allocate_membership_arrays(snapshot, config, pid_dataset)
+    print(f'  Scalar membership allocation: {perf_counter() - t:.1f}s', flush=True)
+
+    depth_by_halo = np.full(len(tree._id_to_idx), -1, dtype=np.int32)
+    if len(tree.halo_ids):
+        depth_by_halo[tree.halo_ids] = tree.depths.astype(np.int32, copy=False)
 
     lib = _load_ahf_parser()
-    lib.fill_ahf_membership_arrays.restype = ctypes.c_long
-    lib.fill_ahf_membership_arrays.argtypes = [
+    lib.fill_ahf_scalar_membership_arrays.restype = ctypes.c_long
+    lib.fill_ahf_scalar_membership_arrays.argtypes = [
         ctypes.c_char_p,
         ctypes.POINTER(ctypes.c_int64),
         ctypes.POINTER(ctypes.c_int32),
         ctypes.c_long,
         ctypes.POINTER(ctypes.c_uint32),
-        ctypes.POINTER(ctypes.c_uint32),
-        ctypes.POINTER(ctypes.c_uint32),
-        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_int8),
         ctypes.c_int64,
         ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int32),
         ctypes.POINTER(ctypes.c_int32),
         ctypes.POINTER(ctypes.c_int32),
         ctypes.POINTER(ctypes.c_int32),
@@ -303,17 +318,16 @@ def build_ahf_snapshot_membership_arrays(snapshot, config, particles_path, halos
     ]
     counts = np.zeros(8, dtype=np.uint64)
     t = perf_counter()
-    written = lib.fill_ahf_membership_arrays(
+    written = lib.fill_ahf_scalar_membership_arrays(
         str(particles_path).encode(),
         raw_halo_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
         ancestor_arrays.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
         len(raw_halo_ids),
-        lookups[0].ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
-        lookups[1].ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
-        lookups[2].ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
-        lookups[3].ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+        row_lookup.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+        slot_lookup.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
         max_pid,
         width,
+        depth_by_halo.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
         arrays_by_slot[0].ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
         arrays_by_slot[1].ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
         arrays_by_slot[2].ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
@@ -324,13 +338,7 @@ def build_ahf_snapshot_membership_arrays(snapshot, config, particles_path, halos
         raise IOError(f'Failed to open {particles_path}')
     print(f'  AHF particle stream: {perf_counter() - t:.1f}s', flush=True)
 
-    t = perf_counter()
-    membership_arrays = {
-        ptype_name: dense_membership_to_sparse_csc(halo_id_array)
-        for ptype_name, halo_id_array in membership_arrays.items()
-    }
-    print(f'  Sparse membership conversion: {perf_counter() - t:.1f}s', flush=True)
-    return tree, membership_arrays, counts
+    return HaloBuildResult(tree, membership_arrays, counts, cached_datasets, ancestor_arrays=ancestor_arrays)
 
 
 def _paths_from_config(config: dict) -> tuple[Path, Path | None]:
@@ -393,13 +401,21 @@ def load_ahf(data_manager, particles_path, halos_path=None, mode='field'):
 
     if mode == 'subhalo':
         with h5py.File(data_manager.snapfile, 'r') as f:
-            tree, membership_arrays, counts = build_ahf_snapshot_membership_arrays(f, data_manager.config, particles_path, halos_path)
+            build_result = build_ahf_snapshot_membership_arrays(f, data_manager.config, particles_path, halos_path)
+            tree, membership_arrays, counts = build_result
+        ancestor_arrays = build_result.ancestor_arrays
         data_manager.halo_tree = tree
         for ptype in data_manager.config['ptypes']:
             ptype_name = data_manager.get_ptype_name(ptype)
-            halo_id_array = membership_arrays[ptype_name]
-            data_manager.halo_id_arrays[ptype] = halo_id_array
-            data_manager.data[ptype]['HaloID'] = pd.Series(_membership_array_exclusive_ids(halo_id_array), dtype='category')
+            membership = membership_arrays[ptype_name]
+            data_manager.halo_id_arrays[ptype] = (
+                ancestor_arrays[np.maximum(membership.astype(np.int64, copy=False) - 1, 0)]
+                if ancestor_arrays is not None else membership
+            )
+            missing = membership == 0
+            if ancestor_arrays is not None and np.any(missing):
+                data_manager.halo_id_arrays[ptype][missing] = -1
+            data_manager.data[ptype]['HaloID'] = pd.Series(_membership_array_exclusive_ids(membership), dtype='category')
         print(f"  Membership array assign: {perf_counter() - t0:.3f}s")
         print(f"  AHF memberships written: {int(counts[:4].sum())}, conflicts resolved: {int(counts[7])}")
     else:

@@ -153,10 +153,8 @@ long fill_ahf_membership_arrays(
     const int64_t *raw_halo_ids,
     const int32_t *ancestor_arrays,
     long n_halos,
-    const uint32_t *lookup_gas,
-    const uint32_t *lookup_dm,
-    const uint32_t *lookup_star,
-    const uint32_t *lookup_bh,
+    const uint32_t *row_lookup,
+    const int8_t *slot_lookup,
     int64_t max_pid,
     int width,
     int32_t *array_gas,
@@ -197,13 +195,9 @@ long fill_ahf_membership_arrays(
             continue;
         }
 
-        uint32_t row = MISSING_ROW;
-        if (slot == 0) row = lookup_gas[a];
-        else if (slot == 1) row = lookup_dm[a];
-        else if (slot == 2) row = lookup_star[a];
-        else row = lookup_bh[a];
-
-        if (row == MISSING_ROW) {
+        uint32_t row = row_lookup[a];
+        int lookup_slot = (int)slot_lookup[a];
+        if (row == MISSING_ROW || lookup_slot != slot) {
             counts[6]++;
             continue;
         }
@@ -213,6 +207,123 @@ long fill_ahf_membership_arrays(
         else if (slot == 1) choose_membership_value(array_dm, row, width, candidate, counts);
         else if (slot == 2) choose_membership_value(array_star, row, width, candidate, counts);
         else choose_membership_value(array_bh, row, width, candidate, counts);
+
+        counts[slot]++;
+        written++;
+    }
+
+    fclose(f);
+    return written;
+}
+
+
+static void choose_scalar_membership_value(
+    int32_t *memberships,
+    uint32_t row,
+    int32_t candidate_hid,
+    const int32_t *ancestor_arrays,
+    const int32_t *depth_by_halo,
+    int width,
+    uint64_t *counts
+)
+{
+    int candidate_depth = depth_by_halo[candidate_hid];
+    if (candidate_depth < 0) return;
+
+    int32_t encoded_current = memberships[row];
+    if (encoded_current <= 0) {
+        memberships[row] = candidate_hid + 1;
+        return;
+    }
+
+    int32_t current_hid = encoded_current - 1;
+    int current_depth = depth_by_halo[current_hid];
+    if (current_depth < 0) {
+        memberships[row] = candidate_hid + 1;
+        return;
+    }
+
+    const int32_t *candidate_ancestors = ancestor_arrays + (uint64_t)candidate_hid * (uint64_t)width;
+    const int32_t *current_ancestors = ancestor_arrays + (uint64_t)current_hid * (uint64_t)width;
+
+    if (current_depth <= candidate_depth && candidate_ancestors[current_depth] == current_hid) {
+        memberships[row] = candidate_hid + 1;
+        return;
+    }
+
+    if (candidate_depth <= current_depth && current_ancestors[candidate_depth] == candidate_hid) {
+        return;
+    }
+
+    counts[7]++;
+    if (
+        candidate_depth > current_depth ||
+        (candidate_depth == current_depth && candidate_hid < current_hid)
+    ) {
+        memberships[row] = candidate_hid + 1;
+    }
+}
+
+long fill_ahf_scalar_membership_arrays(
+    const char *filename,
+    const int64_t *raw_halo_ids,
+    const int32_t *ancestor_arrays,
+    long n_halos,
+    const uint32_t *row_lookup,
+    const int8_t *slot_lookup,
+    int64_t max_pid,
+    int width,
+    const int32_t *depth_by_halo,
+    int32_t *membership_gas,
+    int32_t *membership_dm,
+    int32_t *membership_star,
+    int32_t *membership_bh,
+    uint64_t *counts
+)
+{
+    FILE *f = fopen(filename, "r");
+    if (f == NULL) return -1;
+
+    char line[256];
+    int64_t remaining = 0;
+    long current_halo_id = -1;
+    long long a_ll, b_ll;
+    long written = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "%lld %lld", &a_ll, &b_ll) != 2) continue;
+        int64_t a = (int64_t)a_ll;
+        int64_t b = (int64_t)b_ll;
+
+        if (remaining == 0) {
+            remaining = a;
+            current_halo_id = find_halo_id(b, raw_halo_ids, n_halos);
+            continue;
+        }
+
+        remaining--;
+        int slot = slot_from_raw_ptype(b);
+        if (slot < 0) {
+            counts[4]++;
+            continue;
+        }
+        if (current_halo_id < 0 || a < 0 || a > max_pid) {
+            counts[5]++;
+            continue;
+        }
+
+        uint32_t encoded_row = row_lookup[a];
+        int lookup_slot = (int)slot_lookup[a];
+        if (encoded_row == 0 || lookup_slot != slot + 1) {
+            counts[6]++;
+            continue;
+        }
+        uint32_t row = encoded_row - 1;
+
+        if (slot == 0) choose_scalar_membership_value(membership_gas, row, (int32_t)current_halo_id, ancestor_arrays, depth_by_halo, width, counts);
+        else if (slot == 1) choose_scalar_membership_value(membership_dm, row, (int32_t)current_halo_id, ancestor_arrays, depth_by_halo, width, counts);
+        else if (slot == 2) choose_scalar_membership_value(membership_star, row, (int32_t)current_halo_id, ancestor_arrays, depth_by_halo, width, counts);
+        else choose_scalar_membership_value(membership_bh, row, (int32_t)current_halo_id, ancestor_arrays, depth_by_halo, width, counts);
 
         counts[slot]++;
         written++;

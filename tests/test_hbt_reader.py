@@ -3,7 +3,6 @@ from types import SimpleNamespace
 import h5py
 import pytest
 import numpy as np
-import scipy.sparse as sp
 from yaml import safe_dump
 
 from octavian.halo_filter import filter_snapshot
@@ -131,7 +130,7 @@ def _write_config(path, hbt_path, mode):
     }))
 
 
-def test_hbt_membership_arrays_are_sparse_depth_by_particle(tmp_path):
+def test_hbt_membership_arrays_are_scalar_with_reconstructable_ancestors(tmp_path):
     snapshot = tmp_path / 'snap.hdf5'
     hbt_dir = tmp_path / '050'
     hbt_dir.mkdir()
@@ -150,18 +149,18 @@ def test_hbt_membership_arrays_are_sparse_depth_by_particle(tmp_path):
     }
 
     with h5py.File(snapshot, 'r') as f:
-        _, membership_arrays, _ = build_hbt_snapshot_membership_arrays(f, config, hbt_dir)
+        result = build_hbt_snapshot_membership_arrays(f, config, hbt_dir)
+        _, membership_arrays, _ = result
 
     halo_id_array = membership_arrays['PartType1']
-    assert sp.issparse(halo_id_array)
-    assert halo_id_array.format == 'csc'
-    assert halo_id_array.shape == (2, 3)
-    assert halo_id_array.nnz == 3
-    assert halo_id_array.data.tolist() == [0, 0, 1]
-    assert membership_selected_particles_dense(halo_id_array, [0, 1, 2]).tolist() == [[0, -1], [0, 1], [-1, -1]]
+    assert isinstance(halo_id_array, np.ndarray)
+    assert halo_id_array.shape == (3,)
+    assert halo_id_array.dtype == np.int32
+    assert halo_id_array.tolist() == [1, 2, 0]
+    assert membership_selected_particles_dense(halo_id_array, [0, 1, 2], result.ancestor_arrays).tolist() == [[0, -1], [0, 1], [-1, -1]]
 
 
-def test_hbt_membership_matching_scans_snapshot_ptypes_in_chunks(tmp_path):
+def test_hbt_membership_matching_scans_snapshot_ptypes(tmp_path):
     snapshot = tmp_path / 'snap.hdf5'
     hbt_dir = tmp_path / '050'
     hbt_dir.mkdir()
@@ -184,19 +183,19 @@ def test_hbt_membership_matching_scans_snapshot_ptypes_in_chunks(tmp_path):
     config = {
         'ptype_names': {'gas': 'PartType0', 'dm': 'PartType1'},
         'prop_aliases': {'pid': 'ParticleIDs'},
-        'hbt_particle_id_chunk_size': 2,
     }
 
     with h5py.File(snapshot, 'r') as f:
-        _, membership_arrays, counts = build_hbt_snapshot_membership_arrays(f, config, hbt_dir)
+        result = build_hbt_snapshot_membership_arrays(f, config, hbt_dir)
+        _, membership_arrays, counts = result
 
     assert counts == {'gas': 2, 'dm': 2}
-    assert membership_selected_particles_dense(membership_arrays['PartType0'], [0, 1, 2]).tolist() == [
+    assert membership_selected_particles_dense(membership_arrays['PartType0'], [0, 1, 2], result.ancestor_arrays).tolist() == [
         [0, 1],
         [0, -1],
         [-1, -1],
     ]
-    assert membership_selected_particles_dense(membership_arrays['PartType1'], [0, 1, 2]).tolist() == [
+    assert membership_selected_particles_dense(membership_arrays['PartType1'], [0, 1, 2], result.ancestor_arrays).tolist() == [
         [0, -1],
         [-1, -1],
         [0, 1],
@@ -223,10 +222,11 @@ def test_hbt_membership_stream_chooses_deepest_duplicate_particle(tmp_path):
     }
 
     with h5py.File(snapshot, 'r') as f:
-        _, membership_arrays, counts = build_hbt_snapshot_membership_arrays(f, config, hbt_dir)
+        result = build_hbt_snapshot_membership_arrays(f, config, hbt_dir)
+        _, membership_arrays, counts = result
 
     assert counts == {'dm': 2}
-    assert membership_selected_particles_dense(membership_arrays['PartType1'], [0, 1]).tolist() == [
+    assert membership_selected_particles_dense(membership_arrays['PartType1'], [0, 1], result.ancestor_arrays).tolist() == [
         [0, -1],
         [0, 1],
     ]
@@ -318,7 +318,7 @@ def test_filter_snapshot_uses_hbt_reader_for_subhalo_mode(tmp_path):
         assert f['PartType1']['particle_index'][:].tolist() == [0, 1]
 
 
-def test_filter_snapshot_streams_properties_with_rankid_chunks(tmp_path):
+def test_filter_snapshot_writes_dense_ranked_properties(tmp_path):
     snapshot = tmp_path / 'snap.hdf5'
     hbt_dir = tmp_path / '050'
     hbt_dir.mkdir()
@@ -343,12 +343,11 @@ def test_filter_snapshot_streams_properties_with_rankid_chunks(tmp_path):
     )
     config.write_text(safe_dump({
         'ptype_names': {'dm': 'PartType1'},
-        'prop_aliases': {'pid': 'ParticleIDs'},
+        'prop_aliases': {'pid': 'ParticleIDs', 'mass': 'Masses', 'pos': 'Coordinates'},
         'halo_source': 'hbt',
         'halo_mode': 'subhalo',
         'hbt_subhalo_path': str(hbt_dir),
         'MINIMUM_DM_PER_HALO': 1,
-        'staging_property_chunk_rows': 2,
     }))
 
     filter_snapshot(str(snapshot), str(outfile), str(config), nsplit=2)

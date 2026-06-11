@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from octavian.data_manager import DataManager
 
+from dataclasses import dataclass, field
 from time import perf_counter
 import h5py
 import numpy as np
@@ -36,6 +37,22 @@ from numba import njit
 PTYPE_ENCODE = {'gas': 0, 'dm': 1, 'star': 2, 'bh': 3}
 PTYPE_DECODE = {i: j for j, i in PTYPE_ENCODE.items()} # the inverse operation
 STAGED_HALO_TREE_GROUP = 'OctavianHaloTree'
+
+
+@dataclass
+class HaloBuildResult:
+    """Reader output plus optional source arrays that staging can reuse."""
+
+    tree: 'HaloTree'
+    membership_arrays: dict[str, np.ndarray]
+    counts: object
+    cached_datasets: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    ancestor_arrays: np.ndarray | None = None
+
+    def __iter__(self):
+        yield self.tree
+        yield self.membership_arrays
+        yield self.counts
 
 
 def remap_halo_ids(halo_ids, parent_ids, member_hids):
@@ -73,6 +90,13 @@ def remap_halo_ids(halo_ids, parent_ids, member_hids):
 
 def membership_array_exclusive_ids(halo_id_array) -> np.ndarray:
     """Return the deepest valid halo ID for each particle."""
+    if isinstance(halo_id_array, np.ndarray) and halo_id_array.ndim == 1:
+        out = halo_id_array.astype(np.int64, copy=True)
+        present = out > 0
+        out[present] -= 1
+        out[~present] = -1
+        return out
+
     if sp.issparse(halo_id_array):
         halo_id_array = halo_id_array.tocsc(copy=False)
         n_particles = halo_id_array.shape[1]
@@ -146,15 +170,22 @@ def sparse_membership_from_particle_ancestors(
 
 
 def membership_particle_count(halo_id_array) -> int:
+    if isinstance(halo_id_array, np.ndarray) and halo_id_array.ndim == 1:
+        return halo_id_array.shape[0]
     return halo_id_array.shape[1] if sp.issparse(halo_id_array) else halo_id_array.shape[0]
 
 
 def membership_depth_width(halo_id_array) -> int:
+    if isinstance(halo_id_array, np.ndarray) and halo_id_array.ndim == 1:
+        return 1
     return halo_id_array.shape[0] if sp.issparse(halo_id_array) else halo_id_array.shape[1]
 
 
 def membership_top_ids(halo_id_array) -> np.ndarray:
     """Return a dense top-level halo ID vector aligned to particle rows."""
+    if isinstance(halo_id_array, np.ndarray) and halo_id_array.ndim == 1:
+        return membership_array_exclusive_ids(halo_id_array)
+
     if sp.issparse(halo_id_array):
         halo_id_array = halo_id_array.tocsc(copy=False)
         n_particles = halo_id_array.shape[1]
@@ -237,6 +268,13 @@ def membership_selected_exclusive_ids(halo_id_array, particle_indices: np.ndarra
     if len(particle_indices) == 0:
         return np.empty(0, dtype=np.int64)
 
+    if isinstance(halo_id_array, np.ndarray) and halo_id_array.ndim == 1:
+        selected = halo_id_array[particle_indices].astype(np.int64, copy=True)
+        present = selected > 0
+        selected[present] -= 1
+        selected[~present] = -1
+        return selected
+
     if sp.issparse(halo_id_array):
         selected = halo_id_array.tocsc(copy=False)[:, particle_indices]
         out = np.full(len(particle_indices), -1, dtype=np.int64)
@@ -256,9 +294,25 @@ def membership_selected_exclusive_ids(halo_id_array, particle_indices: np.ndarra
     return out
 
 
-def membership_selected_particles_dense(halo_id_array, particle_indices: np.ndarray) -> np.ndarray:
+def membership_selected_particles_dense(
+    halo_id_array,
+    particle_indices: np.ndarray,
+    ancestor_arrays: np.ndarray | None = None,
+) -> np.ndarray:
     """Return selected particles as dense particle x depth ancestry rows."""
     particle_indices = np.asarray(particle_indices, dtype=np.int64)
+    if isinstance(halo_id_array, np.ndarray) and halo_id_array.ndim == 1:
+        if ancestor_arrays is None:
+            raise ValueError('ancestor_arrays is required for scalar membership arrays')
+        dense = np.full((len(particle_indices), ancestor_arrays.shape[1]), -1, dtype=np.int32)
+        if len(particle_indices) == 0:
+            return dense
+        encoded = halo_id_array[particle_indices]
+        present = encoded > 0
+        if np.any(present):
+            dense[present] = ancestor_arrays[encoded[present].astype(np.int64, copy=False) - 1]
+        return dense
+
     if sp.issparse(halo_id_array):
         if len(particle_indices) == 0:
             return np.full((0, halo_id_array.shape[0]), -1, dtype=np.int32)

@@ -62,6 +62,19 @@ def _rows_by_rank(rank_ids: np.ndarray, nsplit: int) -> list[np.ndarray]:
   return [np.flatnonzero(rank_ids == rank).astype(np.uint32, copy=False) for rank in range(nsplit)]
 
 
+def _ranked_row_selection(rows_by_rank: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+  counts = np.fromiter((len(rows) for rows in rows_by_rank), dtype=np.int64, count=len(rows_by_rank))
+  boundaries = np.empty(len(rows_by_rank) + 1, dtype=np.int64)
+  boundaries[0] = 0
+  np.cumsum(counts, out=boundaries[1:])
+
+  if boundaries[-1] == 0:
+    dtype = rows_by_rank[0].dtype if rows_by_rank else np.uint32
+    return np.empty(0, dtype=dtype), boundaries
+
+  return np.concatenate(rows_by_rank), boundaries
+
+
 def _write_dataset(group, name: str, values) -> None:
   if name in group:
     del group[name]
@@ -124,22 +137,156 @@ def _source_dataset_names(group, config: dict, ptype_name: str) -> list[str]:
   return sorted(names, key=lambda name: (_source_dataset_offset(group[name]), name))
 
 
-def _write_ranked_values(groups: list, name: str, data, rows_by_rank: list[np.ndarray]) -> float:
+def _metallicity_dataset_name(config: dict):
+  return config.get('prop_aliases', {}).get('metallicity')
+
+
+def _include_metallicities(config: dict) -> bool:
+  return bool(config.get('include_metallicities', False))
+
+
+def _rank_ordered_source_dataset_names(config: dict) -> set[str]:
+  props = config.get('staging_rank_order_properties', ('metallicity',))
+  if props is None:
+    return set()
+  if isinstance(props, str):
+    props = (props,)
+
+  prop_aliases = config.get('prop_aliases', {})
+  metallicity_name = _metallicity_dataset_name(config)
+  names = set()
+  for prop in props:
+    name = prop_aliases.get(prop, prop)
+    if name is None:
+      continue
+    if name == metallicity_name and not _include_metallicities(config):
+      continue
+    names.add(name)
+  return names
+
+
+def _write_ranked_values(groups: list, name: str, data, rows_by_rank: list[np.ndarray], ranked_rows=None) -> float:
   t = perf_counter()
-  for rank, rows in enumerate(rows_by_rank):
-    _write_dataset(groups[rank], name, data[rows])
+  if ranked_rows is None:
+    for rank, rows in enumerate(rows_by_rank):
+      _write_dataset(groups[rank], name, data[rows])
+    return perf_counter() - t
+
+  ordered_rows, boundaries = ranked_rows
+  selected = data[ordered_rows]
+  for rank in range(len(rows_by_rank)):
+    _write_dataset(groups[rank], name, selected[boundaries[rank]:boundaries[rank + 1]])
   return perf_counter() - t
 
 
+def _ranked_rows_for_dataset(name: str, rank_ordered_names: set[str], rows_by_rank: list[np.ndarray], ranked_rows_cache: list) -> tuple[np.ndarray, np.ndarray] | None:
+  if name not in rank_ordered_names:
+    return None
+  if ranked_rows_cache[0] is None:
+    ranked_rows_cache[0] = _ranked_row_selection(rows_by_rank)
+  return ranked_rows_cache[0]
+
+
+def _rank_order_gap_rows(config: dict) -> int:
+  gap_rows = int(config.get('staging_rank_order_gap_rows', 4096))
+  if gap_rows < 0:
+    raise ValueError('staging_rank_order_gap_rows must be non-negative')
+  return gap_rows
+
+
+def _rank_order_max_read_fraction(config: dict) -> float:
+  fraction = float(config.get('staging_rank_order_max_read_fraction', 0.9))
+  if fraction <= 0 or fraction > 1:
+    raise ValueError('staging_rank_order_max_read_fraction must be in the range (0, 1]')
+  return fraction
+
+
+def _destination_index_dtype(counts: np.ndarray):
+  max_count = int(counts.max()) if len(counts) else 0
+  return np.uint32 if max_count <= np.iinfo(np.uint32).max else np.int64
+
+
+def _write_empty_ranked_datasets(groups: list, name: str, dataset, counts: np.ndarray) -> tuple[float, float, str]:
+  output_shape = tuple(dataset.shape[1:])
+  t = perf_counter()
+  for rank, count in enumerate(counts):
+    values = np.empty((int(count),) + output_shape, dtype=dataset.dtype)
+    _write_dataset(groups[rank], name, values)
+  return 0.0, perf_counter() - t, 'hdf5_intervals'
+
+
+def _write_ranked_hdf5_full(groups: list, name: str, dataset, rows_by_rank: list[np.ndarray], t0: float) -> tuple[float, float, str]:
+  data = dataset[:]
+  read_time = perf_counter() - t0
+  ranked_rows = _ranked_row_selection(rows_by_rank)
+  write_time = _write_ranked_values(groups, name, data, rows_by_rank, ranked_rows)
+  del data
+  return read_time, write_time, 'hdf5_ranked_full'
+
+
+def _write_ranked_hdf5_intervals(groups: list, name: str, dataset, rows_by_rank: list[np.ndarray], config: dict) -> tuple[float, float, str]:
+  t = perf_counter()
+  counts = np.fromiter((len(rows) for rows in rows_by_rank), dtype=np.int64, count=len(rows_by_rank))
+  if int(counts.sum()) == 0:
+    return _write_empty_ranked_datasets(groups, name, dataset, counts)
+
+  all_rows = np.concatenate(rows_by_rank)
+  order = np.argsort(all_rows, kind='stable')
+  sorted_rows = all_rows[order]
+  gaps = np.diff(sorted_rows.astype(np.int64, copy=False))
+  starts = np.concatenate(([0], np.flatnonzero(gaps > _rank_order_gap_rows(config)) + 1))
+  ends = np.concatenate((starts[1:], [len(sorted_rows)]))
+  read_rows = np.sum(sorted_rows[ends - 1].astype(np.int64) - sorted_rows[starts].astype(np.int64) + 1)
+
+  if float(read_rows) / len(dataset) >= _rank_order_max_read_fraction(config):
+    del all_rows, order, sorted_rows, gaps, starts, ends
+    return _write_ranked_hdf5_full(groups, name, dataset, rows_by_rank, t)
+
+  rank_dtype = _rank_dtype(len(rows_by_rank))
+  dest_dtype = _destination_index_dtype(counts)
+  all_rank = np.concatenate([np.full(len(rows), rank, dtype=rank_dtype) for rank, rows in enumerate(rows_by_rank)])
+  all_dest = np.concatenate([np.arange(int(count), dtype=dest_dtype) for count in counts])
+  sorted_rank = all_rank[order]
+  sorted_dest = all_dest[order]
+  del all_rows, all_rank, all_dest, order, gaps
+
+  output_shape = tuple(dataset.shape[1:])
+  outputs = [np.empty((int(count),) + output_shape, dtype=dataset.dtype) for count in counts]
+
+  for i0, i1 in zip(starts, ends):
+    start = int(sorted_rows[i0])
+    stop = int(sorted_rows[i1 - 1]) + 1
+    block = dataset[start:stop]
+    local_rows = sorted_rows[i0:i1].astype(np.int64, copy=False) - start
+    values = block[local_rows]
+    ranks = sorted_rank[i0:i1]
+    destinations = sorted_dest[i0:i1]
+    for rank, output in enumerate(outputs):
+      mask = ranks == rank
+      if np.any(mask):
+        output[destinations[mask]] = values[mask]
+
+  read_time = perf_counter() - t
+
+  t = perf_counter()
+  for rank, output in enumerate(outputs):
+    _write_dataset(groups[rank], name, output)
+  write_time = perf_counter() - t
+  return read_time, write_time, 'hdf5_intervals'
+
+
 def _read_staging_source_dataset(dataset, name: str, config: dict):
-  metallicity_name = config.get('prop_aliases', {}).get('metallicity')
-  if name == metallicity_name and getattr(dataset, 'ndim', 1) > 1:
+  if name == _metallicity_dataset_name(config) and not _include_metallicities(config) and getattr(dataset, 'ndim', 1) > 1:
     return dataset[:, 0:1]
   return dataset[:]
 
 
 def _is_scalar_membership(membership) -> bool:
   return isinstance(membership, np.ndarray) and membership.ndim == 1
+
+
+def _halo_catalog_is_empty(tree) -> bool:
+  return tree is not None and len(getattr(tree, 'halo_ids', ())) == 0
 
 
 def _membership_top_id_counts_for_weights(membership, ancestor_arrays) -> tuple[np.ndarray, np.ndarray]:
@@ -208,6 +355,8 @@ def _stage_ptype_scalar(
       raise ValueError(f'{ptype}/{name} has {len(f[ptype][name])} rows but expected {n_particles}')
 
   rows_by_rank, exclusive_by_rank = _scalar_rows_by_rank(membership, ancestor_arrays, rank_lookup, nsplit)
+  rank_ordered_names = _rank_ordered_source_dataset_names(config)
+  ranked_rows_cache = [None]
   selected = sum(len(rows) for rows in rows_by_rank)
   print(f'{ptype} staging selected={selected} datasets={len(source_names)}', flush=True)
 
@@ -225,7 +374,8 @@ def _stage_ptype_scalar(
     t = perf_counter()
     data = ptype_cache.pop(name)
     read_time = perf_counter() - t
-    write_time = _write_ranked_values(groups, name, data, rows_by_rank)
+    ranked_rows = _ranked_rows_for_dataset(name, rank_ordered_names, rows_by_rank, ranked_rows_cache)
+    write_time = _write_ranked_values(groups, name, data, rows_by_rank, ranked_rows)
     timings[name] = read_time + write_time
     print(f'{ptype} {name}: read={read_time:.1f}s write={write_time:.1f}s source=cached', flush=True)
     del data
@@ -235,13 +385,17 @@ def _stage_ptype_scalar(
     if key in source_reads:
       raise RuntimeError(f'{ptype}/{name} would be read from the source snapshot more than once')
     source_reads.add(key)
-    t = perf_counter()
-    data = _read_staging_source_dataset(f[ptype][name], name, config)
-    read_time = perf_counter() - t
-    write_time = _write_ranked_values(groups, name, data, rows_by_rank)
+    if name in rank_ordered_names:
+      read_time, write_time, source = _write_ranked_hdf5_intervals(groups, name, f[ptype][name], rows_by_rank, config)
+    else:
+      t = perf_counter()
+      data = _read_staging_source_dataset(f[ptype][name], name, config)
+      read_time = perf_counter() - t
+      write_time = _write_ranked_values(groups, name, data, rows_by_rank)
+      source = 'hdf5'
+      del data
     timings[name] = read_time + write_time
-    print(f'{ptype} {name}: read={read_time:.1f}s write={write_time:.1f}s source=hdf5', flush=True)
-    del data
+    print(f'{ptype} {name}: read={read_time:.1f}s write={write_time:.1f}s source={source}', flush=True)
 
   t = perf_counter()
   for rank, exclusive in enumerate(exclusive_by_rank):
@@ -299,6 +453,8 @@ def _stage_ptype_dense(
   top_ids = halo_id_array[:, 0]
   rank_ids = _dense_rank_ids(top_ids, rank_lookup, rank_dtype)
   rows_by_rank = _rows_by_rank(rank_ids, nsplit)
+  rank_ordered_names = _rank_ordered_source_dataset_names(config)
+  ranked_rows_cache = [None]
   selected = sum(len(rows) for rows in rows_by_rank)
   print(f'{ptype} staging selected={selected} datasets={len(source_names)}', flush=True)
 
@@ -332,7 +488,8 @@ def _stage_ptype_dense(
     t = perf_counter()
     data = ptype_cache.pop(name)
     read_time = perf_counter() - t
-    write_time = _write_ranked_values(groups, name, data, rows_by_rank)
+    ranked_rows = _ranked_rows_for_dataset(name, rank_ordered_names, rows_by_rank, ranked_rows_cache)
+    write_time = _write_ranked_values(groups, name, data, rows_by_rank, ranked_rows)
     timings[name] = read_time + write_time
     print(f'{ptype} {name}: read={read_time:.1f}s write={write_time:.1f}s source=cached', flush=True)
     del data
@@ -342,13 +499,17 @@ def _stage_ptype_dense(
     if key in source_reads:
       raise RuntimeError(f'{ptype}/{name} would be read from the source snapshot more than once')
     source_reads.add(key)
-    t = perf_counter()
-    data = _read_staging_source_dataset(f[ptype][name], name, config)
-    read_time = perf_counter() - t
-    write_time = _write_ranked_values(groups, name, data, rows_by_rank)
+    if name in rank_ordered_names:
+      read_time, write_time, source = _write_ranked_hdf5_intervals(groups, name, f[ptype][name], rows_by_rank, config)
+    else:
+      t = perf_counter()
+      data = _read_staging_source_dataset(f[ptype][name], name, config)
+      read_time = perf_counter() - t
+      write_time = _write_ranked_values(groups, name, data, rows_by_rank)
+      source = 'hdf5'
+      del data
     timings[name] = read_time + write_time
-    print(f'{ptype} {name}: read={read_time:.1f}s write={write_time:.1f}s source=hdf5', flush=True)
-    del data
+    print(f'{ptype} {name}: read={read_time:.1f}s write={write_time:.1f}s source={source}', flush=True)
 
   for name in ['HaloID', 'particle_index'] + (['HaloID_array'] if mode == 'subhalo' else []):
     print(f'{ptype} {name}: {timings[name]:.1f}s', flush=True)
@@ -438,6 +599,9 @@ def filter_snapshot(snapfile: str, outfile: str, configfile: str, nsplit: int=4)
       cached_datasets = getattr(build_result, 'cached_datasets', {})
       ancestor_arrays = getattr(build_result, 'ancestor_arrays', None)
       print(f'  Built {halo_source.upper()} membership arrays: {perf_counter() - t:.1f}s', flush=True)
+      if _halo_catalog_is_empty(tree):
+        print(f'  {halo_source.upper()} catalog is empty; skipping snapshot.', flush=True)
+        return
       if isinstance(counts, np.ndarray):
         print(f'  {halo_source.upper()} memberships written: {int(counts[:4].sum())}, conflicts resolved: {int(counts[7])}', flush=True)
       else:

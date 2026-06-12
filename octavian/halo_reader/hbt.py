@@ -462,6 +462,17 @@ def build_hbt_snapshot_membership_arrays(snapshot, config, subhalo_path, snap_in
     width = int(tree.depths.max()) + 1 if len(tree.depths) else 1
     ancestor_arrays = build_halo_ancestor_arrays(tree, width)
 
+    if len(tree.halo_ids) == 0:
+        membership_arrays = {}
+        counts = {ptype: 0 for ptype in config.get('ptype_names', {})}
+        for ptype, ptype_name in config.get('ptype_names', {}).items():
+            if ptype not in PTYPE_ENCODE:
+                continue
+            if ptype_name in snapshot and pid_dataset in snapshot[ptype_name]:
+                membership_arrays[ptype_name] = np.zeros(len(snapshot[ptype_name][pid_dataset]), dtype=np.int32)
+        print('  HBT catalog empty; skipping particle ID lookup and particle stream.', flush=True)
+        return HaloBuildResult(tree, membership_arrays, counts, {}, ancestor_arrays=ancestor_arrays)
+
     t = perf_counter()
     max_pid, row_lookup, slot_lookup, arrays_by_slot, cached_datasets = _build_particle_location_lookup(
         snapshot,

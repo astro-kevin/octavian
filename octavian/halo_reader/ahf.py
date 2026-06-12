@@ -284,8 +284,14 @@ def build_ahf_snapshot_membership_arrays(snapshot, config, particles_path, halos
     tree, raw_halo_ids = read_ahf_tree(halos_path)
     print(f'  AHF halo tree: {perf_counter() - t:.1f}s', flush=True)
     pid_dataset = config.get('prop_aliases', {}).get('pid', 'ParticleIDs')
-    width = int(tree.depths.max()) + 1
+    width = int(tree.depths.max()) + 1 if len(tree.depths) else 1
     ancestor_arrays = _build_halo_ancestor_arrays(tree, width)
+
+    if len(tree.halo_ids) == 0:
+        membership_arrays, _ = _allocate_membership_arrays(snapshot, config, pid_dataset)
+        counts = np.zeros(8, dtype=np.uint64)
+        print('  AHF catalog empty; skipping particle ID lookup and particle stream.', flush=True)
+        return HaloBuildResult(tree, membership_arrays, counts, {}, ancestor_arrays=ancestor_arrays)
 
     t = perf_counter()
     max_pid, row_lookup, slot_lookup, cached_datasets = _build_particle_location_lookup(snapshot, config, pid_dataset)

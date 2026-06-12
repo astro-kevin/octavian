@@ -268,6 +268,27 @@ def test_load_hbt_subhalo_uses_membership_array_builder(tmp_path):
     ]
 
 
+
+def test_filter_snapshot_skips_empty_hbt_catalog(tmp_path, capsys):
+    snapshot = tmp_path / 'snap.hdf5'
+    hbt_dir = tmp_path / '050'
+    hbt_dir.mkdir()
+    config = tmp_path / 'config.yaml'
+    outfile = tmp_path / 'split'
+    _write_snapshot(snapshot, particle_ids=[11, 12, 99])
+    _write_subsnap(hbt_dir / 'SubSnap_050.0.hdf5', [], [])
+    _write_config(config, hbt_dir, 'subhalo')
+
+    filter_snapshot(str(snapshot), str(outfile), str(config), nsplit=2)
+
+    captured = capsys.readouterr().out
+    assert 'HBT catalog empty; skipping particle ID lookup and particle stream.' in captured
+    assert 'HBT catalog is empty; skipping snapshot.' in captured
+    assert 'Particle ID location lookup' not in captured
+    assert not (tmp_path / 'split_0.hdf5').exists()
+    assert not (tmp_path / 'split_1.hdf5').exists()
+
+
 def test_filter_snapshot_uses_hbt_reader_for_field_mode(tmp_path):
     snapshot = tmp_path / 'snap.hdf5'
     hbt_dir = tmp_path / '050'
@@ -367,6 +388,58 @@ def test_filter_snapshot_writes_dense_ranked_properties(tmp_path):
         assert f['PartType1']['HaloID'][:].tolist() == [1, 1]
         assert f['PartType1']['HaloID_array'][:].tolist() == [[1], [1]]
         assert f['PartType1']['particle_index'][:].tolist() == [1, 4]
+
+
+@pytest.mark.parametrize('include_metallicities', [False, True])
+def test_filter_snapshot_metallicity_columns_follow_include_option(tmp_path, include_metallicities):
+    snapshot = tmp_path / 'snap.hdf5'
+    hbt_dir = tmp_path / '050'
+    hbt_dir.mkdir()
+    config = tmp_path / 'config.yaml'
+    outfile = tmp_path / 'split'
+
+    particle_ids = np.asarray([11, 21, 12, 99, 22, 13], dtype=np.int64)
+    metallicity = np.arange(len(particle_ids) * 3, dtype=np.float32).reshape(len(particle_ids), 3)
+    with h5py.File(snapshot, 'w') as f:
+        f.create_group('Header')
+        ptype = f.create_group('PartType0')
+        ptype.create_dataset('ParticleIDs', data=particle_ids)
+        ptype.create_dataset('Metallicity', data=metallicity)
+
+    _write_subsnap(
+        hbt_dir / 'SubSnap_050.0.hdf5',
+        [
+            {'TrackId': 100, 'HostHaloId': 7, 'Rank': 0, 'NestedParentTrackId': -1},
+            {'TrackId': 200, 'HostHaloId': 8, 'Rank': 0, 'NestedParentTrackId': -1},
+        ],
+        [[11, 12, 13], [21, 22]],
+    )
+    config_values = {
+        'ptype_names': {'gas': 'PartType0'},
+        'prop_aliases': {'pid': 'ParticleIDs', 'metallicity': 'Metallicity'},
+        'halo_source': 'hbt',
+        'halo_mode': 'subhalo',
+        'hbt_subhalo_path': str(hbt_dir),
+        'MINIMUM_DM_PER_HALO': 1,
+    }
+    if include_metallicities:
+        config_values['include_metallicities'] = True
+    config.write_text(safe_dump(config_values))
+
+    filter_snapshot(str(snapshot), str(outfile), str(config), nsplit=2)
+
+    expected_rank0 = metallicity[[0, 2, 5]] if include_metallicities else metallicity[[0, 2, 5], 0:1]
+    expected_rank1 = metallicity[[1, 4]] if include_metallicities else metallicity[[1, 4], 0:1]
+
+    with h5py.File(f'{outfile}_0.hdf5', 'r') as f:
+        data = f['PartType0']['Metallicity'][:]
+        assert data.shape == expected_rank0.shape
+        assert data.tolist() == expected_rank0.tolist()
+
+    with h5py.File(f'{outfile}_1.hdf5', 'r') as f:
+        data = f['PartType0']['Metallicity'][:]
+        assert data.shape == expected_rank1.shape
+        assert data.tolist() == expected_rank1.tolist()
 
 
 def test_filter_snapshot_writes_pruned_staged_tree_per_top_halo(tmp_path):

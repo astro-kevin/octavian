@@ -10,6 +10,7 @@ from octavian.halo_reader import (
   prune_halo_tree,
   write_staged_halo_tree,
 )
+from octavian.utils.hdf5_metadata import mark_complete, mark_incomplete, write_header_simulation_metadata
 
 def find_nearest(array, value):
     idx = (np.abs(array - value)).argmin()
@@ -79,6 +80,21 @@ def _write_dataset(group, name: str, values) -> None:
   if name in group:
     del group[name]
   group.create_dataset(name, data=values)
+
+
+def _initialise_split_files(source: h5py.File, outfile: str, nsplit: int) -> None:
+  for i in range(nsplit):
+    with h5py.File(f'{outfile}_{i}.hdf5', 'a') as f_out:
+      mark_incomplete(f_out, 'staging_split')
+      if 'Header' not in f_out:
+        source.copy(source['Header'], f_out, 'Header')
+      write_header_simulation_metadata(f_out, source['Header'])
+
+
+def _mark_split_files_complete(outfile: str, nsplit: int) -> None:
+  for i in range(nsplit):
+    with h5py.File(f'{outfile}_{i}.hdf5', 'a') as f_out:
+      mark_complete(f_out)
 
 
 def _source_dataset_offset(dataset) -> int:
@@ -544,9 +560,7 @@ def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: d
   lightest rank. This keeps all particles needed for one halo calculation together while
   balancing the expensive FOF6D and group-property phases.
   """
-  for i in range(nsplit):
-    with h5py.File(f'{outfile}_{i}.hdf5', 'a') as f_out:
-      f.copy(f['Header'], f_out, 'Header')
+  _initialise_split_files(f, outfile, nsplit)
 
   # Process the largest membership arrays first so temporary arrays can be released earlier.
   ptypes = sorted(membership_arrays, key=lambda ptype: membership_arrays[ptype].nbytes, reverse=True)
@@ -604,6 +618,8 @@ def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: d
       with h5py.File(f'{outfile}_{i}.hdf5', 'a') as f_out:
         write_staged_halo_tree(f_out, pruned_tree)
 
+  _mark_split_files_complete(outfile, nsplit)
+
 def filter_snapshot(snapfile: str, outfile: str, configfile: str, nsplit: int=4):
   """
   Weighted snapshot filter.
@@ -644,9 +660,7 @@ def filter_snapshot(snapfile: str, outfile: str, configfile: str, nsplit: int=4)
       print(f'  Wrote split snapshots: {perf_counter() - t:.1f}s', flush=True)
       return
 
-    for i in range(nsplit):
-      with h5py.File(f'{outfile}_{i}.hdf5', 'a') as f_out:
-        f.copy(f['Header'], f_out, 'Header')
+    _initialise_split_files(f, outfile, nsplit)
 
     #
     # algorithm to weight split snapshot
@@ -726,6 +740,8 @@ def filter_snapshot(snapfile: str, outfile: str, configfile: str, nsplit: int=4)
                 f_out.require_group(ptype)
                 f_out[ptype][dataset] = data[rank_masks[i]]
 
+    _mark_split_files_complete(outfile, nsplit)
+
 def filter_snapshot_unweighted(snapfile: str, outfile: str, nsplit: int=4):
   """
   Filters snapshot simply by number of particles.
@@ -740,9 +756,7 @@ def filter_snapshot_unweighted(snapfile: str, outfile: str, nsplit: int=4):
 
   # original Jakub implemenation
   with h5py.File(snapfile, 'r') as f:
-    for i in range(nsplit):
-      with h5py.File(f'{outfile}_{i}.hdf5', 'a') as f_out:
-        f.copy(f['Header'], f_out, 'Header')
+    _initialise_split_files(f, outfile, nsplit)
 
 
     ptypes = [group for group in list(f.keys()) if 'HaloID' in list(f[group].keys())]
@@ -774,3 +788,5 @@ def filter_snapshot_unweighted(snapfile: str, outfile: str, nsplit: int=4):
             f_out.require_group(ptype)
             in_halos = np.logical_and(ids > start, ids <= end)
             f_out[ptype][dataset] = data[in_halos]
+
+    _mark_split_files_complete(outfile, nsplit)

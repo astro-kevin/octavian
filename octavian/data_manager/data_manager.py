@@ -7,6 +7,7 @@ from astropy.cosmology import FlatLambdaCDM
 from sympy import sympify
 from octavian.utils import setup_logger
 from octavian.halo_reader.halo_utils import membership_top_ids
+from octavian.utils.hdf5_metadata import file_type as hdf5_file_type, validate_complete
 from time import perf_counter
 
 class DataManager:
@@ -51,7 +52,13 @@ class DataManager:
     self.config = config
 
     with h5py.File(self.snapfile) as f:
+      validate_complete(f, self.snapfile)
       groups = list(f.keys())
+      self.file_type = hdf5_file_type(f)
+      self.is_staged_snapshot = self.file_type == 'staging_split' or any(
+        isinstance(f[group], h5py.Group) and 'particle_index' in f[group]
+        for group in groups
+      )
 
     ptypes = []
     for ptype, ptype_name in self.config['ptype_names'].items():

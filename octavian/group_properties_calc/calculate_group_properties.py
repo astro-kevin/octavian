@@ -44,6 +44,7 @@ from octavian.group_properties_calc.group_helpers import (
     weighted_mean_per_group,
     extract_particle_arrays,
 )
+from octavian.utils.local_densities import calculate_local_density_arrays
 
 # Suppress pandas fragmented frame performance warnings (superfluous)  https://stackoverflow.com/a/76306267
 import warnings
@@ -1052,23 +1053,13 @@ def calculate_local_densities(data_manager: DataManager) -> None:
       print(f"No group data!")
       continue
 
-    pos = group_data[['x_total', 'y_total', 'z_total']].to_numpy()
-    mass = group_data['mass_total'].to_numpy()
-
-    # REVIEW: moving a FOF6D optimisation into this function
-    # previously the pandas .explode() calls were memory-intensive
-    boxsize = data_manager.simulation['boxsize']
-    pos = np.where(pos > boxsize, pos - boxsize, pos)
-    pos = np.where(pos < 0, pos + boxsize, pos)
-    tree = KDTree(pos, boxsize=boxsize)
-    for radius in [300., 1000., 3000.]:
-      volume = 4./3. * np.pi * radius**3
-      index_lists = tree.query_ball_point(pos, radius, workers=-1) # workers=-1 means all processors are used (from documentation)
-      mass_sums = np.array([mass[il].sum() for il in index_lists])
-      counts = np.array([len(il) for il in index_lists])
-
-      group_data[f'local_mass_density_{int(radius)}'] = mass_sums / volume
-      group_data[f'local_number_density_{int(radius)}'] = counts / volume
+    densities = calculate_local_density_arrays(
+      group_data[['x_total', 'y_total', 'z_total']].to_numpy(),
+      group_data['mass_total'].to_numpy(),
+      data_manager.simulation['boxsize'],
+    )
+    for column, values in densities.items():
+      group_data[column] = values
 
 
 def _flatten_neighbor_lists(neighbor_lists):
@@ -1352,10 +1343,12 @@ def calculate_group_properties(data_manager: DataManager) -> None:
         data_manager.data[ptype].drop(columns=['vx', 'vy', 'vz'], inplace=True, errors='ignore')
 
   # densities
-  if 'local_densities' in to_process:
+  if 'local_densities' in to_process and not getattr(data_manager, 'is_staged_snapshot', False):
     phase_start = perf_counter()
     calculate_local_densities(data_manager)
     data_manager.logger.info(f'Local density properties done in {perf_counter() - phase_start:.2f} seconds.')
+  elif 'local_densities' in to_process:
+    data_manager.logger.info('Skipping local density properties for staged shard; merge recomputes them globally.')
 
   phase_start = perf_counter()
   _assign_halo_source_properties(data_manager)

@@ -1,7 +1,16 @@
 import h5py
+import pytest
 import numpy as np
 from yaml import safe_dump
 
+from octavian.utils.hdf5_metadata import (
+    COMPLETE_ATTR,
+    FILE_TYPE_ATTR,
+    mark_complete,
+    mark_incomplete,
+    read_simulation_metadata,
+    write_simulation_metadata,
+)
 from octavian.utils.merge_catalogues import _halo_index_columns, merge_catalogues
 
 
@@ -183,3 +192,49 @@ def test_merge_catalogues_remaps_hbt_indices_and_merges_list_columns(tmp_path):
         assert halos['galaxy_index_list'].dtype.kind in 'iu'
         assert halos['galaxy_index_list'][:].tolist() == [2, 1, 0]
         assert halos['galaxy_index_list_lengths'][:].tolist() == [1, 1, 1]
+
+
+
+def _write_density_rank(path, source_id, mass, position, stale_density):
+    with h5py.File(path, 'w') as f:
+        mark_incomplete(f, 'rank_output')
+        write_simulation_metadata(f, {'boxsize': 1000.0})
+        halos = f.create_group('halo_data')
+        halos.create_dataset('groupID', data=np.asarray([source_id], dtype=np.int64))
+        halos.create_dataset('pos', data=np.asarray([position], dtype=float))
+        halos.create_dataset('dicts/masses.total', data=np.asarray([mass], dtype=float))
+        halos.create_dataset('dicts/local_mass_density.300', data=np.asarray([stale_density], dtype=float))
+        halos.create_dataset('dicts/local_number_density.300', data=np.asarray([stale_density], dtype=float))
+        f.create_group('galaxy_data')
+        mark_complete(f)
+
+
+def test_merge_catalogues_recomputes_local_densities_globally(tmp_path):
+    first = tmp_path / 'catalogue_0.hdf5'
+    second = tmp_path / 'catalogue_1.hdf5'
+    outfile = tmp_path / 'merged.hdf5'
+    config = tmp_path / 'config.yaml'
+
+    _write_density_rank(first, source_id=10, mass=1.0, position=[0.0, 0.0, 0.0], stale_density=-99.0)
+    _write_density_rank(second, source_id=20, mass=3.0, position=[100.0, 0.0, 0.0], stale_density=-99.0)
+
+    config.write_text(safe_dump({
+        'dataset_columns': {
+            'groupID': {'halos': 'groupID'},
+            'pos': {'halos': ['x_total', 'y_total', 'z_total']},
+            'dicts/masses.total': {'halos': 'mass_total'},
+            'dicts/local_mass_density.300': {'halos': 'local_mass_density_300'},
+            'dicts/local_number_density.300': {'halos': 'local_number_density_300'},
+        },
+    }))
+
+    merge_catalogues([str(first), str(second)], str(outfile), str(config))
+
+    volume = 4.0 / 3.0 * np.pi * 300.0**3
+    with h5py.File(outfile, 'r') as f:
+        halos = f['halo_data']
+        assert bool(f.attrs[COMPLETE_ATTR]) is True
+        assert f.attrs[FILE_TYPE_ATTR] == 'merged_catalogue'
+        assert read_simulation_metadata(f)['boxsize'] == 1000.0
+        assert halos['dicts/local_mass_density.300'][:].tolist() == pytest.approx([4.0 / volume, 4.0 / volume])
+        assert halos['dicts/local_number_density.300'][:].tolist() == pytest.approx([2.0 / volume, 2.0 / volume])

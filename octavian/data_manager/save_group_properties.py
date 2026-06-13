@@ -9,6 +9,7 @@ import os
 import numpy as np
 from time import perf_counter
 from octavian.utils.dataset_columns import resolve_dataset_columns, resolve_list_dataset_columns
+from octavian.utils.hdf5_metadata import mark_complete, mark_incomplete, write_simulation_metadata
 
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -56,6 +57,9 @@ def save_group_properties(data_manager: DataManager, filename: str) -> None:
     os.remove(filename)
 
   with h5py.File(filename, 'w') as f:
+    mark_incomplete(f, 'rank_output')
+    write_simulation_metadata(f, data_manager.simulation)
+
     halo_data = f.create_group('halo_data')
     halo_columns = data_manager.group_data['halos'].columns
 
@@ -99,6 +103,8 @@ def save_group_properties(data_manager: DataManager, filename: str) -> None:
       galaxy_column = _column_for_group(column, 'galaxies')
       if 'galaxies' in config['groups'] and isinstance(galaxy_column, str) and galaxy_column in galaxy_columns:
         _write_sequence_dataset(galaxy_data, dataset_name, data_manager.group_data['galaxies'][galaxy_column].to_numpy(dtype=object))
+
+    mark_complete(f)
 
   t2 = perf_counter()
   data_manager.logger.info(f'Saving datasets done in {t2-t1:.2f} seconds.')

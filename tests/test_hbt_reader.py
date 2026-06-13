@@ -15,6 +15,7 @@ from octavian.halo_reader.hbt import (
     read_particles,
     read_subhalos,
 )
+from octavian.utils.hdf5_metadata import COMPLETE_ATTR, FILE_TYPE_ATTR, read_simulation_metadata
 
 
 HBT_DTYPE = np.dtype([
@@ -113,7 +114,13 @@ def _write_snapshot(path, particle_ids=None):
         particle_ids = [11, 12, 99]
     particle_ids = np.asarray(particle_ids, dtype=np.int64)
     with h5py.File(path, 'w') as f:
-        f.create_group('Header')
+        header = f.create_group('Header')
+        header.attrs['BoxSize'] = 1000.0
+        header.attrs['Omega0'] = 0.3
+        header.attrs['OmegaLambda'] = 0.7
+        header.attrs['HubbleParam'] = 0.68
+        header.attrs['Redshift'] = 0.0
+        header.attrs['Time'] = 1.0
         ptype = f.create_group('PartType1')
         ptype.create_dataset('ParticleIDs', data=particle_ids)
         ptype.create_dataset('Masses', data=np.ones(len(particle_ids), dtype=np.float64))
@@ -334,6 +341,9 @@ def test_filter_snapshot_uses_hbt_reader_for_subhalo_mode(tmp_path):
     filter_snapshot(str(snapshot), str(outfile), str(config), nsplit=1)
 
     with h5py.File(f'{outfile}_0.hdf5', 'r') as f:
+        assert bool(f.attrs[COMPLETE_ATTR]) is True
+        assert f.attrs[FILE_TYPE_ATTR] == 'staging_split'
+        assert read_simulation_metadata(f)['boxsize'] == 1000.0
         assert f['PartType1']['HaloID'][:].tolist() == [0, 1]
         assert f['PartType1']['HaloID_array'][:].tolist() == [[0, -1], [0, 1]]
         assert f['PartType1']['particle_index'][:].tolist() == [0, 1]

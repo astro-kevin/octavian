@@ -5,6 +5,14 @@ from collections.abc import Mapping
 from yaml import safe_load
 from octavian.halo_reader import halo_source_metadata_schema
 from octavian.utils.dataset_columns import resolve_dataset_columns, resolve_list_dataset_columns
+from octavian.utils.hdf5_metadata import (
+  mark_complete,
+  mark_incomplete,
+  read_simulation_metadata,
+  validate_complete,
+  write_simulation_metadata,
+)
+from octavian.utils.local_densities import calculate_local_density_arrays
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -18,6 +26,90 @@ def _empty_values(dataset: str, length: int):
   if dataset in {'pos', 'vel', 'minpotpos', 'minpotvel'} or '_L' in dataset:
     return np.full((length, 3), np.nan)
   return np.full(length, np.nan)
+
+
+def _replace_dataset(group, dataset: str, values) -> None:
+  parent_path, _, name = dataset.rpartition('/')
+  parent = group.require_group(parent_path) if parent_path else group
+  if name in parent:
+    del parent[name]
+  parent.create_dataset(name, data=values)
+
+
+def _dataset_for_column(config, group_name: str, wanted):
+  for dataset, column in resolve_dataset_columns(config).items():
+    group_column = _column_for_group(column, group_name)
+    if isinstance(wanted, (list, tuple)):
+      if isinstance(group_column, (list, tuple)) and list(group_column) == list(wanted):
+        return dataset
+    elif group_column == wanted:
+      return dataset
+  return None
+
+
+def _local_density_output_datasets(config, group_name: str) -> dict[str, str]:
+  columns = {
+    'local_mass_density_300',
+    'local_mass_density_1000',
+    'local_mass_density_3000',
+    'local_number_density_300',
+    'local_number_density_1000',
+    'local_number_density_3000',
+  }
+  outputs = {}
+  for dataset, column in resolve_dataset_columns(config).items():
+    group_column = _column_for_group(column, group_name)
+    if isinstance(group_column, str) and group_column in columns:
+      outputs[group_column] = dataset
+  return outputs
+
+
+def _read_first_simulation_metadata(files: list[str]) -> dict:
+  for file in files:
+    with h5py.File(file, 'r') as f:
+      validate_complete(f, file)
+      simulation = read_simulation_metadata(f)
+      if simulation:
+        return simulation
+  return {}
+
+
+def _simulation_boxsize(simulation: dict):
+  for key in ('boxsize', 'BoxSize', 'header_BoxSize'):
+    if key in simulation:
+      return np.asarray(simulation[key]).reshape(-1)[0]
+  raise ValueError('Cannot calculate global local densities without simulation boxsize metadata')
+
+
+def _write_empty_local_density_datasets(out_group, outputs: dict[str, str]) -> None:
+  for dataset in outputs.values():
+    _replace_dataset(out_group, dataset, np.empty(0, dtype=float))
+
+
+def _write_global_local_densities(out_group, config, group_name: str, simulation: dict) -> None:
+  outputs = _local_density_output_datasets(config, group_name)
+  if not outputs:
+    return
+
+  pos_dataset = _dataset_for_column(config, group_name, ['x_total', 'y_total', 'z_total'])
+  mass_dataset = _dataset_for_column(config, group_name, 'mass_total')
+  if pos_dataset is None or mass_dataset is None:
+    raise ValueError(f'Cannot calculate {group_name} local densities without position and total mass output columns')
+
+  if pos_dataset not in out_group or mass_dataset not in out_group:
+    id_dataset = 'GalID' if group_name == 'galaxies' else 'HaloID'
+    if id_dataset in out_group and len(out_group[id_dataset]) == 0:
+      _write_empty_local_density_datasets(out_group, outputs)
+      return
+    raise ValueError(f'Cannot calculate {group_name} local densities; merged position or mass datasets are missing')
+
+  densities = calculate_local_density_arrays(
+    out_group[pos_dataset][:],
+    out_group[mass_dataset][:],
+    _simulation_boxsize(simulation),
+  )
+  for column, dataset in outputs.items():
+    _replace_dataset(out_group, dataset, densities[column])
 
 
 def _columns_for_group(columns, group_name: str):
@@ -81,6 +173,7 @@ def _write_merged_csr_dataset(out_group, dataset: str, files: list[str], group_k
   for file in files:
     n_rows = file_lengths[length_key][file]
     with h5py.File(file, 'r') as f_in:
+      validate_complete(f_in, file)
       if group_key not in f_in:
         all_indices.append(np.empty(0, dtype=np.int64))
         all_lengths.append(np.zeros(n_rows, dtype=np.int32))
@@ -136,6 +229,8 @@ def merge_catalogues(files: list[str], outfile: str, configfile: str) -> None:
   with open(configfile, 'r') as f:
     config = safe_load(f)
 
+  simulation = _read_first_simulation_metadata(files)
+
   galaxy_parent_halo = []
   halo_source_ids = []
   halo_masses = []
@@ -144,6 +239,7 @@ def merge_catalogues(files: list[str], outfile: str, configfile: str) -> None:
 
   for file in files:
     with h5py.File(file, 'r') as f:
+      validate_complete(f, file)
       file_lengths['halos'][file] = len(f['halo_data']['dicts/masses.total'])
       try:
         file_lengths['galaxies'][file] = len(f['galaxy_data']['dicts/masses.total'])
@@ -196,6 +292,10 @@ def merge_catalogues(files: list[str], outfile: str, configfile: str) -> None:
   halo_index_columns = _halo_index_columns(config)
 
   with h5py.File(outfile, 'w') as f_out:
+    mark_incomplete(f_out, 'merged_catalogue')
+    if simulation:
+      write_simulation_metadata(f_out, simulation)
+
     halo_group = f_out.create_group('halo_data')
     galaxy_group = f_out.create_group('galaxy_data')
 
@@ -215,6 +315,7 @@ def merge_catalogues(files: list[str], outfile: str, configfile: str) -> None:
 
       for file in files:
         with h5py.File(file, 'r') as f:
+          validate_complete(f, file)
           if include_halos:
             try:
               values = f['halo_data'][dataset][:]
@@ -284,3 +385,7 @@ def merge_catalogues(files: list[str], outfile: str, configfile: str) -> None:
         if _column_for_group(column, group_name) is None:
           continue
         _write_merged_csr_dataset(out_group, dataset, files, group_key, order, file_lengths)
+
+    _write_global_local_densities(halo_group, config, 'halos', simulation)
+    _write_global_local_densities(galaxy_group, config, 'galaxies', simulation)
+    mark_complete(f_out)

@@ -225,11 +225,19 @@ def _write_ranked_hdf5_full(groups: list, name: str, dataset, rows_by_rank: list
 
 
 def _write_ranked_hdf5_intervals(groups: list, name: str, dataset, rows_by_rank: list[np.ndarray], config: dict) -> tuple[float, float, str]:
+  """Copy selected HDF5 rows into rank outputs without always reading the full source dataset.
+
+  Rows are first sorted by source offset so nearby selections can be read as contiguous
+  intervals. If those intervals cover most of the dataset, this falls back to a single full
+  read because that is cheaper than many small HDF5 slices.
+  """
   t = perf_counter()
   counts = np.fromiter((len(rows) for rows in rows_by_rank), dtype=np.int64, count=len(rows_by_rank))
   if int(counts.sum()) == 0:
     return _write_empty_ranked_datasets(groups, name, dataset, counts)
 
+  # Sort all requested source rows once, then split at large gaps. Each resulting interval is
+  # small enough to avoid loading unrelated particles while still keeping HDF5 reads sequential.
   all_rows = np.concatenate(rows_by_rank)
   order = np.argsort(all_rows, kind='stable')
   sorted_rows = all_rows[order]
@@ -347,6 +355,12 @@ def _stage_ptype_scalar(
   source_reads: set[tuple[str, str]],
   config: dict,
 ) -> None:
+  """Stage one particle type from scalar encoded halo memberships.
+
+  Scalar memberships store ``halo_id + 1`` for the deepest matched source halo. The
+  accompanying ``ancestor_arrays`` are used to recover the top-level halo for rank routing
+  and to write full ancestry rows when subhalo mode requests ``HaloID_array``.
+  """
   n_particles = len(membership)
   source_names = _source_dataset_names(f[ptype], config, ptype)
   ptype_cache = cached_datasets.get(ptype, {})
@@ -367,6 +381,8 @@ def _stage_ptype_scalar(
 
   timings = {}
 
+  # Some readers already had to load source datasets while building memberships. Reuse those
+  # arrays first so the original snapshot is not read twice.
   cached_names = [name for name in source_names if name in ptype_cache]
   hdf5_names = [name for name in source_names if name not in ptype_cache]
 
@@ -437,6 +453,12 @@ def _stage_ptype_dense(
   config: dict,
   ancestor_arrays: np.ndarray | None = None,
 ) -> None:
+  """Stage one particle type from dense particle x ancestry halo arrays.
+
+  Dense rows already contain every valid ancestor from top-level halo to deepest subhalo.
+  Rank assignment is therefore based on the first column, while the scalar ``HaloID`` output
+  is either the top halo or the deepest valid halo depending on the requested mode.
+  """
   if _is_scalar_membership(halo_id_array):
     if ancestor_arrays is None:
       raise ValueError('ancestor_arrays is required for scalar halo memberships')
@@ -515,10 +537,18 @@ def _stage_ptype_dense(
     print(f'{ptype} {name}: {timings[name]:.1f}s', flush=True)
 
 def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: dict, nsplit: int, membership_arrays: dict[str, np.ndarray], mode: str, tree=None, cached_datasets=None, ancestor_arrays=None):
+  """Write split snapshots from external halo-reader memberships.
+
+  The algorithm routes whole top-level halos to ranks. It estimates rank cost from star,
+  gas, and DM membership counts, then greedily assigns the heaviest halos to the currently
+  lightest rank. This keeps all particles needed for one halo calculation together while
+  balancing the expensive FOF6D and group-property phases.
+  """
   for i in range(nsplit):
     with h5py.File(f'{outfile}_{i}.hdf5', 'a') as f_out:
       f.copy(f['Header'], f_out, 'Header')
 
+  # Process the largest membership arrays first so temporary arrays can be released earlier.
   ptypes = sorted(membership_arrays, key=lambda ptype: membership_arrays[ptype].nbytes, reverse=True)
   star_weights, gas_weights, dm_weights = {}, {}, {}
   for ptype_name, weight_dict in [('PartType4', star_weights), ('PartType0', gas_weights), ('PartType1', dm_weights)]:
@@ -536,6 +566,7 @@ def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: d
     cgp_cost = n_total
     weights[hid] = 0.6 * fof6d_cost + 0.4 * cgp_cost
 
+  # Greedy bin packing: largest estimated halos first, always placed on the lightest rank.
   rank_assignments = [set() for _ in range(nsplit)]
   rank_loads = [0] * nsplit
   for hid in sorted(weights, key=weights.get, reverse=True):
@@ -568,6 +599,7 @@ def filter_snapshot_with_membership_arrays(f: h5py.File, outfile: str, config: d
 
   if tree is not None:
     for i, halo_ids_in_rank in enumerate(rank_halo_ids):
+      # Store only the hierarchy needed by this shard, including ancestors of selected halos.
       pruned_tree = prune_halo_tree(tree, halo_ids_in_rank)
       with h5py.File(f'{outfile}_{i}.hdf5', 'a') as f_out:
         write_staged_halo_tree(f_out, pruned_tree)
@@ -576,7 +608,7 @@ def filter_snapshot(snapfile: str, outfile: str, configfile: str, nsplit: int=4)
   """
   Weighted snapshot filter.
 
-  This snapshot filter is designed to be weighted towards balancing FOF6D. It does so by applying a 
+  This snapshot filter is designed to be weighted towards balancing FOF6D. It does so by applying a
   power law to star/gas counts when deciding how to divide the snapshot. FOF6D can take extremely long
   and ranks can have wildly different runtimes if the snapshot is not weighted when filtered.
   """
@@ -625,11 +657,11 @@ def filter_snapshot(snapfile: str, outfile: str, configfile: str, nsplit: int=4)
     star_weights = {}
     gas_weights = {}
     dm_weights = {}
-    
+
     for ptype_name, weight_dict in [
     ('PartType4', star_weights),
     ('PartType0', gas_weights),
-    ('PartType1', dm_weights),  
+    ('PartType1', dm_weights),
     ]: # config is not passed so refer to them by PartType
       ptype_ids = f[ptype_name]['HaloID'][:] # access star/gas particles and their halo IDs
       ptype_ids = ptype_ids[ptype_ids != 0] # access only the stars/gas in a valid halo
@@ -658,10 +690,10 @@ def filter_snapshot(snapfile: str, outfile: str, configfile: str, nsplit: int=4)
 
     # simple sequential binning algorithm
     rank_assignments = [set() for _ in range(nsplit)] # initialise a set
-    rank_loads = [0] * nsplit 
+    rank_loads = [0] * nsplit
     for hid in sorted(weights, key=weights.get, reverse=True): # sort by heaviest first
         # we go from heaviest -> lightest, adding the next halo to the bin with the smallest load
-        lightest = np.argmin(rank_loads) # find which rank has the lowest load 
+        lightest = np.argmin(rank_loads) # find which rank has the lowest load
         rank_assignments[lightest].add(hid)
         rank_loads[lightest] += weights[hid]
 
@@ -700,7 +732,7 @@ def filter_snapshot_unweighted(snapfile: str, outfile: str, nsplit: int=4):
 
   This can cause load balancing issues:
 
-  FOF6D is more sensitive to particle type distributions because it does not care for dark matter particles. 
+  FOF6D is more sensitive to particle type distributions because it does not care for dark matter particles.
   This means that the largest halos by total nparticles are not necessarily the most computationally expensive,
   meaning you can end up with wildly different FOF6D runtimes across ranks.
 

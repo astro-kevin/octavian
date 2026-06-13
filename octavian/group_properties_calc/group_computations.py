@@ -21,7 +21,7 @@ def compute_centre_of_mass(pos, vel, mass, group_idx, n_groups):
     com_pos = np.zeros((n_groups, 3))
     com_vel = np.zeros((n_groups, 3))
     total_mass = np.zeros(n_groups)
-    
+
     for i in prange(len(mass)):
         g = group_idx[i]
         m = mass[i]
@@ -29,13 +29,13 @@ def compute_centre_of_mass(pos, vel, mass, group_idx, n_groups):
         for d in range(3):
             com_pos[g, d] += pos[i, d] * m
             com_vel[g, d] += vel[i, d] * m
-    
+
     for g in range(n_groups):
         if total_mass[g] > 0:
             for d in range(3):
                 com_pos[g, d] /= total_mass[g]
                 com_vel[g, d] /= total_mass[g]
-    
+
     return com_pos, com_vel, total_mass
 
 @njit(parallel=True)
@@ -63,35 +63,35 @@ def compute_rotation_quantities(pos_rel, vel_rel, mass, group_idx, L_group, n_gr
     counter_rotating_mass = np.zeros(n_groups)
     krot_sum = np.zeros(n_groups)
     ktot_sum = np.zeros(n_groups)
-    
+
     for i in prange(len(mass)):
         g = group_idx[i]
         rx, ry, rz = pos_rel[i, 0], pos_rel[i, 1], pos_rel[i, 2]
         vx, vy, vz = vel_rel[i, 0], vel_rel[i, 1], vel_rel[i, 2]
         m = mass[i]
-        
+
         px, py, pz = m * vx, m * vy, m * vz
         Lx = ry * pz - rz * py
         Ly = rz * px - rx * pz
         Lz = rx * py - ry * px
-        
+
         Lgx, Lgy, Lgz = L_group[g, 0], L_group[g, 1], L_group[g, 2]
         L_dot = Lx * Lgx + Ly * Lgy + Lz * Lgz
-        
+
         if L_dot < 0:
             counter_rotating_mass[g] += m
-        
+
         cx = ry * Lgz - rz * Lgy
         cy = rz * Lgx - rx * Lgz
         cz = rx * Lgy - ry * Lgx
         rz_cyl = np.sqrt(cx**2 + cy**2 + cz**2)
-        
+
         ktot = 0.5 * m * (vx**2 + vy**2 + vz**2)
         ktot_sum[g] += ktot
-        
+
         if rz_cyl > 0.0:
             krot_sum[g] += 0.5 * (L_dot / rz_cyl)**2 / m
-    
+
     return counter_rotating_mass, krot_sum, ktot_sum
 
 @njit
@@ -330,6 +330,10 @@ def compute_aperture_component_properties(
     particle_velocities,
     include_matrix,
 ):
+    """Reduce aperture neighbor lists into component masses and velocity dispersions.
+
+    include_matrix maps particle-type codes to each requested output component, allowing
+    one neighbor pass to fill gas, star, HI, H2, dust, total, and baryon outputs."""
     n_galaxies = len(neighbor_offsets) - 1
     n_outputs = include_matrix.shape[0]
 
@@ -404,6 +408,10 @@ def compute_galaxy_hydrogen_assignment(
     n_galaxies,
     boxsize,
 ):
+    """Assign gas HI and H2 masses to galaxies inside matching host-halo blocks.
+
+    Within a host halo, each gas particle chooses the galaxy maximizing stellar mass over
+    periodic distance squared while keeping the sweep local to one halo at a time."""
     galaxy_HI = np.zeros(n_galaxies)
     galaxy_H2 = np.zeros(n_galaxies)
     halfbox = 0.5 * boxsize
@@ -520,6 +528,10 @@ def accumulate_membership_array_common_first(
     mass_mode,
     do_minpot,
 ):
+    """First pass for common properties over particle ancestry arrays.
+
+    Every valid ancestry entry contributes to its corresponding output halo. For black
+    holes, mass_mode keeps the maximum mass instead of summing particle masses."""
     width = halo_id_array.shape[1]
     for i in range(halo_id_array.shape[0]):
         m = masses[i]
@@ -708,6 +720,10 @@ def compute_membership_array_gas_scalar_sums(
     n_groups,
     nhlim,
 ):
+    """Accumulate gas scalar outputs over every valid halo ancestry entry.
+
+    This mirrors compute_gas_scalar_sums but uses particle by ancestry arrays instead of
+    a single group index, so subhalo and ancestor rows receive their own gas totals."""
     group_mass = np.zeros(n_groups)
     gas_HI = np.zeros(n_groups)
     gas_H2 = np.zeros(n_groups)

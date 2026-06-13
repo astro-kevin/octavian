@@ -66,6 +66,11 @@ def _remap_halo_source_ids(values, sorted_halo_source_ids, halo_source_order, ha
 
 
 def _write_merged_csr_dataset(out_group, dataset: str, files: list[str], group_key: str, order, file_lengths):
+  """Merge variable-length CSR datasets while applying the final row ordering.
+
+  Each shard stores rows as flat indices plus per-row lengths. The merge reconstructs
+  row slices, reorders those slices with the scalar dataset order, then serializes the
+  reordered slices back to CSR form."""
   length_key = 'halos' if group_key == 'halo_data' else 'galaxies'
   all_indices = []
   all_lengths = []
@@ -105,6 +110,7 @@ def _write_merged_csr_dataset(out_group, dataset: str, files: list[str], group_k
   if not seen:
     return
 
+  # Build row offsets in pre-merge order, then pull those row slices in final order.
   old_lengths = np.concatenate(all_lengths).astype(np.int64, copy=False)
   old_offsets = np.concatenate([[0], np.cumsum(old_lengths[:-1])]).astype(np.int64)
   merged_lengths = old_lengths[order].astype(length_dtype, copy=False)

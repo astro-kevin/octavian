@@ -71,7 +71,7 @@ def read_ahf_particles(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     The format of these is slightly fiddly because the format alternates.
     Data structure of AHF catalog:
 
-    Number of Particles | Halo ID 
+    Number of Particles | Halo ID
     Particle ID | Particle Type
     Particle ID | Particle Type
     etc. with alternating lengths under the halo header, making reading the output finicky.
@@ -129,23 +129,23 @@ def read_ahf_particles_c(filepath, n_estimate=None):
     Requires ahf_parser.so to be compiled in the same directory.
     """
     import ctypes
-    
+
     so_path = Path(__file__).parent / 'ahf_parser.so'
     if not so_path.exists():
         raise FileNotFoundError(f'Compiled parser not found at {so_path}. Compile with: gcc -O2 -shared -fPIC -o ahf_parser.so ahf_parser.c')
-    
+
     lib = ctypes.CDLL(str(so_path))
     lib.parse_ahf_particles.restype = ctypes.c_long
-    
+
     filepath = Path(filepath)
     if n_estimate is None:
         n_estimate = filepath.stat().st_size // 8
-    
+
     out_hids = np.empty(n_estimate, dtype=np.int64)
     out_pids = np.empty(n_estimate, dtype=np.int64)
     out_ptypes = np.empty(n_estimate, dtype=np.int8)
     valid_ptypes = np.array([0, 1, 4, 5], dtype=np.int32)
-    
+
     n = lib.parse_ahf_particles(
         str(filepath).encode(),
         out_hids.ctypes.data_as(ctypes.POINTER(ctypes.c_long)),
@@ -154,18 +154,18 @@ def read_ahf_particles_c(filepath, n_estimate=None):
         valid_ptypes.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         len(valid_ptypes)
     )
-    
+
     if n < 0:
         raise IOError(f'Failed to open {filepath}')
-    
+
     # C parser returns raw AHF ptype codes (0, 1, 4, 5)
     # map to Octavian encoding (0, 1, 2, 3)
     ptype_remap = np.full(6, -1, dtype=np.int8)  # max AHF code is 5
     for ahf_code, octavian_code in _PTYPE_MAP.items():
         ptype_remap[ahf_code] = octavian_code
-    
+
     result_ptypes = ptype_remap[out_ptypes[:n]]
-    
+
     return out_hids[:n].copy(), out_pids[:n].copy(), result_ptypes.copy()
 
 def _remap_ahf_ids(halo_ids, parent_ids, member_hids):
@@ -277,6 +277,12 @@ def _allocate_membership_arrays(snapshot, config, pid_dataset):
     return membership_arrays, by_slot
 
 def build_ahf_snapshot_membership_arrays(snapshot, config, particles_path, halos_path=None):
+    """Build per-particle AHF memberships directly against an open snapshot.
+
+    The AHF particle file is streamed once and matched against snapshot particle-ID lookup
+    tables. The result is one scalar encoded membership array per particle type plus the
+    halo ancestry table needed to expand those scalar IDs into top-to-deepest rows later.
+    """
     particles_path = Path(particles_path)
     if halos_path is None:
         halos_path = particles_path.with_name(particles_path.name.replace('particles', 'halos'))
@@ -285,6 +291,8 @@ def build_ahf_snapshot_membership_arrays(snapshot, config, particles_path, halos
     print(f'  AHF halo tree: {perf_counter() - t:.1f}s', flush=True)
     pid_dataset = config.get('prop_aliases', {}).get('pid', 'ParticleIDs')
     width = int(tree.depths.max()) + 1 if len(tree.depths) else 1
+    # Each compact halo ID gets a fixed-width ancestry row. Scalar memberships can then
+    # store only the deepest halo ID and recover the whole chain during staging.
     ancestor_arrays = _build_halo_ancestor_arrays(tree, width)
 
     if len(tree.halo_ids) == 0:
@@ -294,6 +302,8 @@ def build_ahf_snapshot_membership_arrays(snapshot, config, particles_path, halos
         return HaloBuildResult(tree, membership_arrays, counts, {}, ancestor_arrays=ancestor_arrays)
 
     t = perf_counter()
+    # Particle-ID lookup tables map external AHF particle IDs back to snapshot row and
+    # particle-type slot without sorting a giant all-particle table in Python.
     max_pid, row_lookup, slot_lookup, cached_datasets = _build_particle_location_lookup(snapshot, config, pid_dataset)
     print(f'  Particle ID lookups: {perf_counter() - t:.1f}s', flush=True)
     t = perf_counter()
@@ -324,6 +334,8 @@ def build_ahf_snapshot_membership_arrays(snapshot, config, particles_path, halos
     ]
     counts = np.zeros(8, dtype=np.uint64)
     t = perf_counter()
+    # The C parser walks the alternating AHF header/member format and updates the scalar
+    # arrays in place, resolving overlapping memberships consistently by depth.
     written = lib.fill_ahf_scalar_membership_arrays(
         str(particles_path).encode(),
         raw_halo_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
@@ -394,7 +406,7 @@ def load_ahf(data_manager, particles_path, halos_path=None, mode='field'):
     data_manager.config['halo_mode'] = mode
 
     particles_path = Path(particles_path)
-    
+
     if halos_path is None:
         halos_path = particles_path.with_name(
             particles_path.name.replace('particles', 'halos')
@@ -428,7 +440,7 @@ def load_ahf(data_manager, particles_path, halos_path=None, mode='field'):
         t1 = perf_counter()
         tree, member_hids, member_pids, member_ptypes = read_ahf_membership(particles_path, halos_path)
         print(f"Finished in {(perf_counter() - t1):.3f} seconds.")
-    
+
         print(f"Extracting halo structure and membership...")
         t0 = perf_counter()
         print(f"  HaloTree: {perf_counter() - t0:.3f}s")

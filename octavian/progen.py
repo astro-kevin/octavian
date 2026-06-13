@@ -257,6 +257,7 @@ def _link_pair(
     recompute: bool,
     save: bool,
 ) -> dict[str, object]:
+    """Link one newest-to-older catalogue pair and optionally persist the result."""
     source_column = _SOURCE_COLUMNS[halo_source]
     current_halos = _read_group_snapshot(current_file, 'halo_data', source_column, required=True)
     progenitor_halos = _read_group_snapshot(progenitor_file, 'halo_data', source_column, required=True)
@@ -319,6 +320,10 @@ def _link_galaxies(
     progenitor_snapshot: _PathSpec | None,
     min_in_common: float,
 ):
+    """Choose galaxy progenitors from halo candidates using shared stellar particles.
+
+    Halo merger information narrows the candidate set. Within those candidate host halos,
+    galaxies are ranked by shared star count, shared-fraction threshold, and progenitor mass."""
     current_stars = _read_galaxy_star_particle_ids(current_galaxies.path, current_snapshot)
     progenitor_stars = _read_galaxy_star_particle_ids(progenitor_galaxies.path, progenitor_snapshot)
     if current_stars is None or progenitor_stars is None:
@@ -335,6 +340,8 @@ def _link_galaxies(
     else:
         out = np.full((len(current_galaxies.ids), limit), -1, dtype=np.int64)
 
+    # Evaluate only galaxies inside plausible progenitor host halos; this avoids
+    # all-to-all galaxy particle intersections.
     for current_row, candidate_hosts in enumerate(host_candidates):
         current_particle_ids = current_stars[current_row]
         if len(current_particle_ids) == 0 or len(candidate_hosts) == 0:

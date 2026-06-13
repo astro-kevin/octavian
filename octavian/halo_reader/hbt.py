@@ -312,6 +312,11 @@ def _assign_hbt_candidate(
     depth_by_halo: np.ndarray,
     diagnostics: np.ndarray,
 ) -> None:
+    """Merge one HBT candidate halo into the best scalar membership rows.
+
+    Existing assignments are kept when they are deeper descendants of the candidate, replaced
+    when the candidate is deeper, and broken ties are made deterministic by compact halo ID.
+    """
     if len(rows) == 0:
         return
 
@@ -321,6 +326,7 @@ def _assign_hbt_candidate(
     if candidate_depth < 0:
         return
 
+    # Values are encoded as compact_halo_id + 1, leaving zero as the missing sentinel.
     current_values = best_hids[rows]
     empty = current_values == 0
     if np.any(empty):
@@ -379,6 +385,12 @@ def _stream_hbt_particles_into_membership_arrays(
     max_pid: int,
     subhalo_chunk_size: int,
 ) -> np.ndarray:
+    """Stream HBT variable-length particle lists into per-type membership arrays.
+
+    HBT does not store particle types, so particle IDs are looked up against the source
+    snapshot. The stream is chunked by subhalo rows to avoid materializing all memberships
+    at once for split or very large SubSnap outputs.
+    """
     diagnostics = np.zeros(8, dtype=np.uint64)
     halo_offset = 0
 
@@ -387,6 +399,7 @@ def _stream_hbt_particles_into_membership_arrays(
             particles = f['SubhaloParticles']
             n_subhalos = len(particles)
 
+            # Read a bounded block of VLEN particle lists, flatten it, then assign by ptype.
             for start in range(0, n_subhalos, subhalo_chunk_size):
                 end = min(start + subhalo_chunk_size, n_subhalos)
                 particle_chunk = particles[start:end]
@@ -418,6 +431,8 @@ def _stream_hbt_particles_into_membership_arrays(
                 slots = slots[matched] - 1
                 lookup_hids = lookup_hids[matched]
 
+                # Rows are grouped by particle-type slot before conflict resolution so each
+                # output array can be updated without mixing gas, DM, stars, and BHs.
                 for slot, best_hids in enumerate(arrays_by_slot):
                     if best_hids is None:
                         continue
@@ -447,7 +462,12 @@ def _stream_hbt_particles_into_membership_arrays(
 
 
 def build_hbt_snapshot_membership_arrays(snapshot, config, subhalo_path, snap_index=None):
-    """Build universal per-particle halo ancestry arrays from HBT+ output."""
+    """Build scalar per-particle HBT memberships for an open snapshot.
+
+    The reader first builds the compact HBT halo tree and ancestry table, then streams
+    SubSnap particle lists through snapshot particle-ID lookup tables. The returned scalar
+    memberships are compact and can be expanded into full ancestry rows during staging.
+    """
     subhalo_path = Path(subhalo_path)
     t = perf_counter()
     filepaths = gather_subsnap_files(subhalo_path, snap_index)
@@ -460,6 +480,8 @@ def build_hbt_snapshot_membership_arrays(snapshot, config, subhalo_path, snap_in
 
     pid_dataset = config.get('prop_aliases', {}).get('pid', 'ParticleIDs')
     width = int(tree.depths.max()) + 1 if len(tree.depths) else 1
+    # Ancestry rows let downstream code recover top-level hosts without keeping dense
+    # particle x depth arrays during the HBT stream.
     ancestor_arrays = build_halo_ancestor_arrays(tree, width)
 
     if len(tree.halo_ids) == 0:

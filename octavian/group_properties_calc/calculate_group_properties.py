@@ -301,6 +301,11 @@ def _assign_central_galaxies(data_manager: DataManager) -> None:
 
 
 def _common_halo_array_properties(data_manager: DataManager, particle_type: str, ptypes: list[str]) -> None:
+  """Compute common halo properties when particles have top-to-deepest ancestry rows.
+
+  The scalar groupby path cannot be used here because one particle can contribute to
+  several halo rows along its ancestry chain. This path walks every valid ancestry
+  column for every particle and accumulates each output halo independently."""
   group_data = data_manager.group_data['halos']
   n_groups = len(group_data)
   group_map = _group_index_map(group_data)
@@ -315,6 +320,7 @@ def _common_halo_array_properties(data_manager: DataManager, particle_type: str,
   minpot_position = np.full((n_groups, 3), np.nan)
   minpot_velocity = np.full((n_groups, 3), np.nan)
 
+  # First pass: counts, masses, centers of mass, and minimum-potential anchors.
   for ptype in ptypes:
     df = data_manager.data[ptype]
     accumulate_membership_array_common_first(
@@ -365,6 +371,7 @@ def _common_halo_array_properties(data_manager: DataManager, particle_type: str,
     ref_positions = group_data[['minpot_x', 'minpot_y', 'minpot_z']].to_numpy()
     ref_velocities = group_data[['minpot_vx', 'minpot_vy', 'minpot_vz']].to_numpy()
 
+  # Second pass: quantities measured relative to the selected reference position.
   disp_sums = np.zeros(n_groups)
   L = np.zeros((n_groups, 3))
   for ptype in ptypes:
@@ -424,6 +431,8 @@ def _common_halo_array_properties(data_manager: DataManager, particle_type: str,
     vals[small] = 0.
     group_data[col] = vals
 
+  # Radial quantiles need a flattened membership list because particles can appear
+  # once per ancestor halo.
   radial_group_idx, radial_radii, radial_masses = [], [], []
   for ptype in ptypes:
     df = data_manager.data[ptype]
@@ -483,7 +492,7 @@ def common_group_properties(data_manager: DataManager, group_name: str, particle
 
   # -
   # step 1: extract arrays from datamanager so the entire operation can be vectorised
-  # - 
+  # -
 
   if particle_type == 'total':
       ptypes = config['ptypes']
@@ -580,14 +589,14 @@ def common_group_properties(data_manager: DataManager, group_name: str, particle
 
   # -
   # step 3: nparticles
-  # - 
+  # -
 
   counts = count_per_group(group_idx, n_groups) # number of particles per group
   group_data[f'n{particle_type}'] = counts
 
-  # - 
+  # -
   # step 4: masses
-  # - 
+  # -
 
   if particle_type == 'bh':
     group_mass = max_value_per_group(masses, group_idx, n_groups) # REVIEW: why?
@@ -599,7 +608,7 @@ def common_group_properties(data_manager: DataManager, group_name: str, particle
 
   # -
   # step 5: minimum potential for halos
-  # - 
+  # -
 
   if group_name == 'halos' and particle_type == 'total':
 
@@ -615,9 +624,9 @@ def common_group_properties(data_manager: DataManager, group_name: str, particle
       group_data[f'minpot_{d}'] = minimum_potential_position[:, i]
       group_data[f'minpot_v{d}'] = minimum_potential_velocity[:, i]
 
-  # - 
-  # stage 6: centre-of-mass 
-  # - 
+  # -
+  # stage 6: centre-of-mass
+  # -
 
   com_positions = np.zeros((n_groups, 3))
   com_velocities = np.zeros((n_groups, 3))
@@ -666,7 +675,7 @@ def common_group_properties(data_manager: DataManager, group_name: str, particle
   # -
 
   L, ktot = compute_angular_momentum(positions_rel, velocities_rel_ref, masses, group_idx, n_groups)
-  
+
   for i, d in enumerate(['x', 'y', 'z']):
     group_data[f'L{d}_{particle_type}'] = L[:, i]
 
@@ -687,7 +696,7 @@ def common_group_properties(data_manager: DataManager, group_name: str, particle
     f'Lx_{particle_type}', f'Ly_{particle_type}', f'Lz_{particle_type}',
     f'BoverT_{particle_type}', f'kappa_rot_{particle_type}',
     ]
-  
+
   # for small groups: set quantites = 0 as they are not meaningful (as done in original code)
   small = counts < 3
   for col in angular_cols:
@@ -711,9 +720,9 @@ def common_group_properties(data_manager: DataManager, group_name: str, particle
       group_data[f'radius_{particle_type}_{col_name}'] = radial_results[:, q]
   group_data[f'radius_{particle_type}_rmax'] = radius_rmax
 
-  # - 
+  # -
   # step 11: virial quantities for halos
-  # - 
+  # -
 
   if group_name == 'halos' and particle_type == 'total':
     # from previous code
@@ -740,7 +749,7 @@ def common_group_properties(data_manager: DataManager, group_name: str, particle
         group_data[f'mass_{factor}_c'] = virial_m[:, f]
 
 def gas_group_properties(data_manager: DataManager, group_name: str) -> None:
-    
+
   config = data_manager.config
   group_data = data_manager.group_data[group_name]
   groupID_key = config['groupIDs'][group_name]
@@ -835,7 +844,7 @@ def gas_group_properties(data_manager: DataManager, group_name: str) -> None:
   # guard against empty group
   if len(masses) == 0:
     return
-  
+
   n_groups = len(group_data)
   group_idx = group_data.index.get_indexer(group_ids)
   order, unique_groups, start, end = sort_by_group(group_idx)
@@ -1079,6 +1088,10 @@ def _flatten_neighbor_lists(neighbor_lists):
 
 
 def assign_galaxy_hydrogen_masses(data_manager: DataManager) -> None:
+  """Assign halo-level HI and H2 gas to galaxies in the same top-level host.
+
+  Gas particles are grouped by host halo, then each gas particle is assigned to the
+  best galaxy candidate in that host using periodic distance and galaxy mass weighting."""
   if 'galaxies' not in data_manager.group_data or 'gas' not in data_manager.data:
     return
 
@@ -1104,6 +1117,7 @@ def assign_galaxy_hydrogen_masses(data_manager: DataManager) -> None:
     group_data['mass_H2'] = np.zeros(len(group_data))
     return
 
+  # Sort gas and galaxies by host halo so the kernel can sweep matching halo blocks.
   gas_order, gas_unique_halos, gas_start, gas_end = sort_by_group(gas_halos[valid_gas])
   galaxy_order, galaxy_unique_halos, galaxy_start, galaxy_end = sort_by_group(galaxy_halos[valid_galaxies])
   galaxy_rows = np.flatnonzero(valid_galaxies)[galaxy_order].astype(np.int64)
@@ -1128,7 +1142,12 @@ def assign_galaxy_hydrogen_masses(data_manager: DataManager) -> None:
   group_data['mass_H2'] = galaxy_H2
 
 def calculate_aperture_masses(data_manager, config):
-    
+    """Compute 30 kpc aperture masses and velocity dispersions around galaxies.
+
+    Particles and galaxies are grouped by parent halo so each KDTree only covers a
+    halo-local particle set. The include matrix maps raw particle components onto
+    outputs such as gas, HI, H2, dust, total, and baryon."""
+
     group_data = data_manager.group_data['galaxies']
     n_galaxies = len(group_data)
     galaxy_pos = group_data[['x_total', 'y_total', 'z_total']].to_numpy()
@@ -1143,6 +1162,8 @@ def calculate_aperture_masses(data_manager, config):
     )
     # may want to check the helper function include_hydrogen part, thought it might be useful in future
     n_ptypes = len(ptype_names)
+    # include_matrix[out, code] records which particle components contribute to each
+    # output component, including derived total and baryon apertures.
     output_names = ptype_names + ['total', 'baryon']
     output_index = {name: i for i, name in enumerate(output_names)}
     include_matrix = np.zeros((len(output_names), n_ptypes), dtype=np.bool_)
@@ -1168,6 +1189,7 @@ def calculate_aperture_masses(data_manager, config):
     velocity_result = np.zeros((n_galaxies, len(output_names)))
     boxsize = data_manager.simulation['boxsize']
 
+    # Work halo-by-halo so neighbor searches stay small and respect host boundaries.
     for h in range(len(unique_halos)):
         halo_id = unique_halos[h]
         halo_pos = all_pos[h_start[h]:h_end[h]]
@@ -1189,6 +1211,8 @@ def calculate_aperture_masses(data_manager, config):
             continue
 
         # build KDTree (explained in FOF6D code)
+        # Wrap into the periodic box before using a periodic KDTree, so galaxies near
+        # boundaries can see particles across the box edge.
         halo_pos_wrapped = np.mod(halo_pos, boxsize)
         galaxy_pos_wrapped = np.mod(galaxy_pos[gal_indices], boxsize)
         tree = KDTree(halo_pos_wrapped, boxsize=boxsize)
@@ -1311,7 +1335,7 @@ def calculate_group_properties(data_manager: DataManager) -> None:
     for property in ['bhmdot']:
       data_manager.load_property(property, 'bh')
     t9 = perf_counter()
-      
+
     for group in groups:
       bh_group_properties(data_manager, group)
     data_manager.logger.info(f'BH group properties done in {perf_counter() - phase_start:.2f} seconds.')

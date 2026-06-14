@@ -73,8 +73,39 @@ def _group_index_map(group_data) -> np.ndarray:
 
 
 def _assign_empty_common_particle_properties(group_data, particle_type: str, n_groups: int) -> None:
+  zeros = np.zeros(n_groups, dtype=float)
+  nan = np.full(n_groups, np.nan, dtype=float)
+
   group_data[f'n{particle_type}'] = np.zeros(n_groups, dtype=np.int64)
-  group_data[f'mass_{particle_type}'] = np.zeros(n_groups, dtype=float)
+  group_data[f'mass_{particle_type}'] = zeros.copy()
+
+  for d in ['x', 'y', 'z']:
+    group_data[f'{d}_{particle_type}'] = nan.copy()
+    group_data[f'v{d}_{particle_type}'] = nan.copy()
+    group_data[f'L{d}_{particle_type}'] = zeros.copy()
+
+  group_data[f'velocity_dispersion_{particle_type}'] = zeros.copy()
+  group_data[f'L_{particle_type}'] = zeros.copy()
+  group_data[f'ALPHA_{particle_type}'] = zeros.copy()
+  group_data[f'BETA_{particle_type}'] = zeros.copy()
+  group_data[f'BoverT_{particle_type}'] = zeros.copy()
+  group_data[f'kappa_rot_{particle_type}'] = zeros.copy()
+
+  for col_name in ['r20', 'half_mass', 'r80', 'rmax']:
+    group_data[f'radius_{particle_type}_{col_name}'] = nan.copy()
+
+  if particle_type == 'total':
+    for d in ['x', 'y', 'z']:
+      group_data[f'minpot_{d}'] = nan.copy()
+      group_data[f'minpot_v{d}'] = nan.copy()
+
+    group_data['r200'] = zeros.copy()
+    group_data['circular_velocity'] = zeros.copy()
+    group_data['temperature'] = zeros.copy()
+    group_data['spin_param'] = zeros.copy()
+    for factor in [200, 500, 2500]:
+      group_data[f'radius_{factor}_c'] = nan.copy()
+      group_data[f'mass_{factor}_c'] = nan.copy()
 
 
 def _uses_halo_id_arrays(data_manager: DataManager, group_name: str, ptypes: list[str]) -> bool:

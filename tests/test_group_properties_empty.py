@@ -64,6 +64,27 @@ def test_empty_star_regular_path_initializes_mass_star():
     assert halo_data['mass_star'].to_numpy().tolist() == [0.0, 0.0]
 
 
+def test_empty_total_halo_membership_initializes_completion_markers():
+    halo_data = pd.DataFrame(index=np.asarray([0, 1], dtype=np.int64))
+    data_manager = SimpleNamespace(
+        config={
+            'groupIDs': {'halos': 'HaloID'},
+            'ptypes': ['star'],
+            'ptypes_baryon': ['star'],
+        },
+        group_data={'halos': halo_data},
+        data={'star': _empty_star_dataframe()},
+        halo_id_arrays={'star': np.empty((0, 2), dtype=np.int64)},
+    )
+
+    common_group_properties(data_manager, 'halos', 'total')
+
+    assert halo_data['ntotal'].to_numpy().tolist() == [0, 0]
+    assert halo_data['mass_total'].to_numpy().tolist() == [0.0, 0.0]
+    assert halo_data['velocity_dispersion_total'].to_numpy().tolist() == [0.0, 0.0]
+    assert halo_data['temperature'].to_numpy().tolist() == [0.0, 0.0]
+
+
 def test_save_group_properties_writes_empty_completion_schema(tmp_path):
     outfile = tmp_path / 'empty_rank.hdf5'
     halos = pd.DataFrame({'HaloID': np.asarray([], dtype=np.int64)})

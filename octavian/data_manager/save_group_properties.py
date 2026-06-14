@@ -47,10 +47,58 @@ def _write_sequence_dataset(hdf5_group, dataset_name: str, values) -> None:
   hdf5_group.create_dataset(f'{dataset_name}_lengths', data=lengths)
 
 
+def _dataset_exists(hdf5_group, dataset_name: str) -> bool:
+  try:
+    return isinstance(hdf5_group[dataset_name], h5py.Dataset)
+  except KeyError:
+    return False
+
+
+def _write_dataset_if_missing(hdf5_group, dataset_name: str, values) -> None:
+  if not _dataset_exists(hdf5_group, dataset_name):
+    hdf5_group.create_dataset(dataset_name, data=values)
+
+
 def _empty_dataset_values(column, length: int):
   if isinstance(column, (list, tuple)):
     return np.empty((length, len(column)), dtype=float)
   return np.empty(length, dtype=float)
+
+
+def _group_id_values(data_manager: DataManager, group_name: str):
+  group_data = data_manager.group_data[group_name]
+  id_column = data_manager.config['groupIDs'][group_name]
+  if id_column in group_data:
+    return group_data[id_column].to_numpy()
+  return group_data.index.to_numpy(dtype=np.int64)
+
+
+def _column_or_default(group_data, column: str, default=0.0):
+  if column in group_data:
+    return group_data[column].to_numpy()
+  return np.full(len(group_data), default, dtype=float)
+
+
+def _write_rank_completion_schema(data_manager: DataManager, halo_data, galaxy_data) -> None:
+  """Write the minimal rank-catalogue schema even when a staged config is stale."""
+  halos = data_manager.group_data['halos']
+  _write_dataset_if_missing(halo_data, 'groupID', _group_id_values(data_manager, 'halos'))
+  _write_dataset_if_missing(halo_data, 'dicts/masses.total', _column_or_default(halos, 'mass_total'))
+  _write_dataset_if_missing(
+      halo_data,
+      'dicts/velocity_dispersions.total',
+      _column_or_default(halos, 'velocity_dispersion_total'),
+  )
+  _write_dataset_if_missing(
+      halo_data,
+      'dicts/virial_quantities.temperature',
+      _column_or_default(halos, 'temperature'),
+  )
+
+  if galaxy_data is not None and 'galaxies' in data_manager.group_data:
+    galaxies = data_manager.group_data['galaxies']
+    _write_dataset_if_missing(galaxy_data, 'groupID', _group_id_values(data_manager, 'galaxies'))
+    _write_dataset_if_missing(galaxy_data, 'dicts/masses.total', _column_or_default(galaxies, 'mass_total'))
 
 
 def save_group_properties(data_manager: DataManager, filename: str) -> None:
@@ -113,6 +161,8 @@ def save_group_properties(data_manager: DataManager, filename: str) -> None:
       galaxy_column = _column_for_group(column, 'galaxies')
       if 'galaxies' in config['groups'] and isinstance(galaxy_column, str) and galaxy_column in galaxy_columns:
         _write_sequence_dataset(galaxy_data, dataset_name, data_manager.group_data['galaxies'][galaxy_column].to_numpy(dtype=object))
+
+    _write_rank_completion_schema(data_manager, halo_data, galaxy_data if 'galaxies' in config['groups'] else None)
 
     mark_complete(f)
 

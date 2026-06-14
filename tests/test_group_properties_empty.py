@@ -94,6 +94,7 @@ def test_save_group_properties_writes_empty_completion_schema(tmp_path):
         simulation={'boxsize': 1000.0},
         config={
             'groups': ['halos', 'galaxies'],
+            'groupIDs': {'halos': 'HaloID', 'galaxies': 'GalID'},
             'dataset_columns': {
                 'groupID': {'halos': 'HaloID', 'galaxies': 'GalID'},
                 'pos': {'halos': ['x_total', 'y_total', 'z_total']},
@@ -117,3 +118,46 @@ def test_save_group_properties_writes_empty_completion_schema(tmp_path):
         assert halos_out['dicts/masses.total'].shape == (0,)
         assert halos_out['dicts/virial_quantities.temperature'].shape == (0,)
         assert halos_out['dicts/velocity_dispersions.total'].shape == (0,)
+
+
+def test_save_group_properties_writes_completion_schema_when_config_omits_markers(tmp_path):
+    outfile = tmp_path / 'stale_config_rank.hdf5'
+    halos = pd.DataFrame(
+        {
+            'HaloID': np.asarray([10, 20], dtype=np.int64),
+            'mass_total': np.asarray([1.0, 2.0]),
+            'velocity_dispersion_total': np.asarray([3.0, 4.0]),
+            'temperature': np.asarray([5.0, 6.0]),
+        },
+        index=np.asarray([10, 20], dtype=np.int64),
+    )
+    galaxies = pd.DataFrame(
+        {
+            'GalID': np.asarray([], dtype=np.int64),
+            'mass_total': np.asarray([], dtype=float),
+        },
+        index=np.asarray([], dtype=np.int64),
+    )
+    data_manager = SimpleNamespace(
+        logger=SimpleNamespace(info=lambda *_args, **_kwargs: None),
+        simulation={'boxsize': 1000.0},
+        config={
+            'groups': ['halos', 'galaxies'],
+            'groupIDs': {'halos': 'HaloID', 'galaxies': 'GalID'},
+            'dataset_columns': {
+                'groupID': {'halos': 'HaloID', 'galaxies': 'GalID'},
+            },
+            'list_dataset_columns': {},
+        },
+        group_data={'halos': halos, 'galaxies': galaxies},
+        particle_lists={'halos': {}, 'galaxies': {}},
+    )
+
+    save_group_properties(data_manager, str(outfile))
+
+    with h5py.File(outfile, 'r') as handle:
+        halos_out = handle['halo_data']
+        assert halos_out['dicts/masses.total'][:].tolist() == [1.0, 2.0]
+        assert halos_out['dicts/velocity_dispersions.total'][:].tolist() == [3.0, 4.0]
+        assert halos_out['dicts/virial_quantities.temperature'][:].tolist() == [5.0, 6.0]
+        assert handle['galaxy_data']['dicts/masses.total'].shape == (0,)

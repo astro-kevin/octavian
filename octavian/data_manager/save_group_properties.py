@@ -47,6 +47,12 @@ def _write_sequence_dataset(hdf5_group, dataset_name: str, values) -> None:
   hdf5_group.create_dataset(f'{dataset_name}_lengths', data=lengths)
 
 
+def _empty_dataset_values(column, length: int):
+  if isinstance(column, (list, tuple)):
+    return np.empty((length, len(column)), dtype=float)
+  return np.empty(length, dtype=float)
+
+
 def save_group_properties(data_manager: DataManager, filename: str) -> None:
   data_manager.logger.info('Saving datasets...')
   t1 = perf_counter()
@@ -90,10 +96,14 @@ def save_group_properties(data_manager: DataManager, filename: str) -> None:
       halo_column = _column_for_group(column, 'halos')
       if _has_columns(halo_column, halo_columns):
         halo_data.create_dataset(dataset_name, data=data_manager.group_data['halos'][halo_column].to_numpy())
+      elif halo_column is not None and len(data_manager.group_data['halos']) == 0:
+        halo_data.create_dataset(dataset_name, data=_empty_dataset_values(halo_column, 0))
 
       galaxy_column = _column_for_group(column, 'galaxies')
       if 'galaxies' in config['groups'] and _has_columns(galaxy_column, galaxy_columns):
         galaxy_data.create_dataset(dataset_name, data=data_manager.group_data['galaxies'][galaxy_column].to_numpy())
+      elif 'galaxies' in config['groups'] and galaxy_column is not None and len(data_manager.group_data['galaxies']) == 0:
+        galaxy_data.create_dataset(dataset_name, data=_empty_dataset_values(galaxy_column, 0))
 
     for dataset_name, column in resolve_list_dataset_columns(config).items():
       halo_column = _column_for_group(column, 'halos')

@@ -1,12 +1,15 @@
 from types import SimpleNamespace
 
+import h5py
 import numpy as np
 import pandas as pd
 
+from octavian.data_manager.save_group_properties import save_group_properties
 from octavian.group_properties_calc.calculate_group_properties import (
     common_group_properties,
     star_group_properties,
 )
+from octavian.utils.hdf5_metadata import COMPLETE_ATTR
 
 
 def _empty_star_dataframe():
@@ -59,3 +62,37 @@ def test_empty_star_regular_path_initializes_mass_star():
 
     assert halo_data['nstar'].to_numpy().tolist() == [0, 0]
     assert halo_data['mass_star'].to_numpy().tolist() == [0.0, 0.0]
+
+
+def test_save_group_properties_writes_empty_completion_schema(tmp_path):
+    outfile = tmp_path / 'empty_rank.hdf5'
+    halos = pd.DataFrame({'HaloID': np.asarray([], dtype=np.int64)})
+    galaxies = pd.DataFrame({'GalID': np.asarray([], dtype=np.int64)})
+    data_manager = SimpleNamespace(
+        logger=SimpleNamespace(info=lambda *_args, **_kwargs: None),
+        simulation={'boxsize': 1000.0},
+        config={
+            'groups': ['halos', 'galaxies'],
+            'dataset_columns': {
+                'groupID': {'halos': 'HaloID', 'galaxies': 'GalID'},
+                'pos': {'halos': ['x_total', 'y_total', 'z_total']},
+                'dicts/masses.total': {'halos': 'mass_total'},
+                'dicts/virial_quantities.temperature': {'halos': 'temperature'},
+                'dicts/velocity_dispersions.total': {'halos': 'velocity_dispersion_total'},
+            },
+            'list_dataset_columns': {},
+        },
+        group_data={'halos': halos, 'galaxies': galaxies},
+        particle_lists={'halos': {}, 'galaxies': {}},
+    )
+
+    save_group_properties(data_manager, str(outfile))
+
+    with h5py.File(outfile, 'r') as handle:
+        assert bool(handle.attrs[COMPLETE_ATTR]) is True
+        halos_out = handle['halo_data']
+        assert halos_out['groupID'].shape == (0,)
+        assert halos_out['pos'].shape == (0, 3)
+        assert halos_out['dicts/masses.total'].shape == (0,)
+        assert halos_out['dicts/virial_quantities.temperature'].shape == (0,)
+        assert halos_out['dicts/velocity_dispersions.total'].shape == (0,)

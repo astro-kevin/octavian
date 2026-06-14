@@ -392,6 +392,150 @@ def compute_aperture_component_properties(
 
 
 @njit
+def _aperture_output_mass(
+    kind,
+    code_selector,
+    particle_code,
+    raw_mass,
+    hi_mass,
+    h2_mass,
+    dust_mass,
+    total_codes,
+    baryon_codes,
+    gas_code,
+):
+    if kind == 0:
+        if particle_code == code_selector:
+            return raw_mass
+        return 0.0
+    if kind == 1:
+        if total_codes[particle_code]:
+            return raw_mass
+        return 0.0
+    if kind == 2:
+        if baryon_codes[particle_code]:
+            return raw_mass
+        return 0.0
+    if particle_code != gas_code:
+        return 0.0
+    if kind == 3:
+        return hi_mass
+    if kind == 4:
+        return h2_mass
+    if kind == 5:
+        return dust_mass
+    return 0.0
+
+
+@njit(parallel=True)
+def compute_aperture_component_properties_by_kind(
+    neighbor_offsets,
+    neighbor_indices,
+    particle_masses,
+    particle_codes,
+    particle_velocities,
+    particle_hi_masses,
+    particle_h2_masses,
+    particle_dust_masses,
+    output_kinds,
+    output_codes,
+    total_codes,
+    baryon_codes,
+    gas_code,
+):
+    """Reduce aperture neighbors without duplicating gas rows for HI, H2, and dust."""
+    n_galaxies = len(neighbor_offsets) - 1
+    n_outputs = len(output_kinds)
+
+    output_mass = np.zeros((n_galaxies, n_outputs))
+    output_count = np.zeros((n_galaxies, n_outputs), dtype=np.int64)
+    mean_momentum = np.zeros((n_galaxies, n_outputs, 3))
+    momentum_var = np.zeros((n_galaxies, n_outputs, 3))
+    sigma = np.zeros((n_galaxies, n_outputs))
+
+    has_hi = len(particle_hi_masses) != 0
+    has_h2 = len(particle_h2_masses) != 0
+    has_dust = len(particle_dust_masses) != 0
+
+    for g in prange(n_galaxies):
+        s = neighbor_offsets[g]
+        e = neighbor_offsets[g + 1]
+
+        for ni in range(s, e):
+            p = neighbor_indices[ni]
+            code = particle_codes[p]
+            raw_mass = particle_masses[p]
+            hi_mass = particle_hi_masses[p] if has_hi else 0.0
+            h2_mass = particle_h2_masses[p] if has_h2 else 0.0
+            dust_mass = particle_dust_masses[p] if has_dust else 0.0
+
+            for out in range(n_outputs):
+                mass = _aperture_output_mass(
+                    output_kinds[out],
+                    output_codes[out],
+                    code,
+                    raw_mass,
+                    hi_mass,
+                    h2_mass,
+                    dust_mass,
+                    total_codes,
+                    baryon_codes,
+                    gas_code,
+                )
+                if mass <= 0:
+                    continue
+                output_mass[g, out] += mass
+                output_count[g, out] += 1
+                for d in range(3):
+                    mean_momentum[g, out, d] += mass * particle_velocities[p, d]
+
+        for out in range(n_outputs):
+            count = output_count[g, out]
+            if count > 0:
+                for d in range(3):
+                    mean_momentum[g, out, d] /= count
+
+        for ni in range(s, e):
+            p = neighbor_indices[ni]
+            code = particle_codes[p]
+            raw_mass = particle_masses[p]
+            hi_mass = particle_hi_masses[p] if has_hi else 0.0
+            h2_mass = particle_h2_masses[p] if has_h2 else 0.0
+            dust_mass = particle_dust_masses[p] if has_dust else 0.0
+
+            for out in range(n_outputs):
+                mass = _aperture_output_mass(
+                    output_kinds[out],
+                    output_codes[out],
+                    code,
+                    raw_mass,
+                    hi_mass,
+                    h2_mass,
+                    dust_mass,
+                    total_codes,
+                    baryon_codes,
+                    gas_code,
+                )
+                if mass <= 0:
+                    continue
+                for d in range(3):
+                    delta = mass * particle_velocities[p, d] - mean_momentum[g, out, d]
+                    momentum_var[g, out, d] += delta * delta
+
+        for out in range(n_outputs):
+            count = output_count[g, out]
+            if count > 0 and output_mass[g, out] > 0:
+                mean_mass = output_mass[g, out] / count
+                sig2 = 0.0
+                for d in range(3):
+                    axis_sigma = np.sqrt(momentum_var[g, out, d] / count) / mean_mass
+                    sig2 += axis_sigma * axis_sigma
+                sigma[g, out] = np.sqrt(sig2 / 3.0)
+
+    return output_mass, sigma
+
+
+@njit
 def compute_galaxy_hydrogen_assignment(
     gas_unique_halos,
     gas_start,

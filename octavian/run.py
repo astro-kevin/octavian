@@ -8,11 +8,28 @@ from octavian.group_properties_calc import calculate_group_properties, get_parti
 
 from yaml import safe_load
 
+
+def _configure_numba_threads(config: dict) -> None:
+  try:
+    from numba import set_num_threads
+  except ImportError:
+    return
+
+  nproc = int(config.get('nproc', 1))
+  if nproc < 1:
+    return
+  try:
+    set_num_threads(nproc)
+  except ValueError:
+    # Respect NUMBA_NUM_THREADS if the environment has set a lower ceiling.
+    pass
+
 def run(snapshot: str, outfile: str, configfile: str, logfile: str | None = None, comm=None):
   with open(configfile, 'r') as f:
     config = safe_load(f)
 
   config['Tlim'] = float(config['Tlim'])
+  _configure_numba_threads(config)
   if logfile is None:
     logfile = f'{outfile}.log'
 

@@ -158,11 +158,11 @@ def _metallicity_dataset_name(config: dict):
 
 
 def _include_metallicities(config: dict) -> bool:
-  return bool(config.get('include_metallicities', False))
+  return bool(config.get('include_metallicities', True))
 
 
 def _rank_ordered_source_dataset_names(config: dict) -> set[str]:
-  props = config.get('staging_rank_order_properties', ('metallicity',))
+  props = config.get('staging_rank_order_properties', ())
   if props is None:
     return set()
   if isinstance(props, str):
@@ -175,7 +175,7 @@ def _rank_ordered_source_dataset_names(config: dict) -> set[str]:
     name = prop_aliases.get(prop, prop)
     if name is None:
       continue
-    if name == metallicity_name and not _include_metallicities(config):
+    if name == metallicity_name:
       continue
     names.add(name)
   return names
@@ -222,8 +222,8 @@ def _destination_index_dtype(counts: np.ndarray):
   return np.uint32 if max_count <= np.iinfo(np.uint32).max else np.int64
 
 
-def _write_empty_ranked_datasets(groups: list, name: str, dataset, counts: np.ndarray) -> tuple[float, float, str]:
-  output_shape = tuple(dataset.shape[1:])
+def _write_empty_ranked_datasets(groups: list, name: str, dataset, counts: np.ndarray, config: dict) -> tuple[float, float, str]:
+  output_shape = _staging_dataset_output_shape(name, dataset, config)
   t = perf_counter()
   for rank, count in enumerate(counts):
     values = np.empty((int(count),) + output_shape, dtype=dataset.dtype)
@@ -250,7 +250,7 @@ def _write_ranked_hdf5_intervals(groups: list, name: str, dataset, rows_by_rank:
   t = perf_counter()
   counts = np.fromiter((len(rows) for rows in rows_by_rank), dtype=np.int64, count=len(rows_by_rank))
   if int(counts.sum()) == 0:
-    return _write_empty_ranked_datasets(groups, name, dataset, counts)
+    return _write_empty_ranked_datasets(groups, name, dataset, counts, config)
 
   # Sort all requested source rows once, then split at large gaps. Each resulting interval is
   # small enough to avoid loading unrelated particles while still keeping HDF5 reads sequential.
@@ -262,7 +262,7 @@ def _write_ranked_hdf5_intervals(groups: list, name: str, dataset, rows_by_rank:
   ends = np.concatenate((starts[1:], [len(sorted_rows)]))
   read_rows = np.sum(sorted_rows[ends - 1].astype(np.int64) - sorted_rows[starts].astype(np.int64) + 1)
 
-  if float(read_rows) / len(dataset) >= _rank_order_max_read_fraction(config):
+  if not _project_staging_dataset(name, dataset, config) and float(read_rows) / len(dataset) >= _rank_order_max_read_fraction(config):
     del all_rows, order, sorted_rows, gaps, starts, ends
     return _write_ranked_hdf5_full(groups, name, dataset, rows_by_rank, t)
 
@@ -274,13 +274,13 @@ def _write_ranked_hdf5_intervals(groups: list, name: str, dataset, rows_by_rank:
   sorted_dest = all_dest[order]
   del all_rows, all_rank, all_dest, order, gaps
 
-  output_shape = tuple(dataset.shape[1:])
+  output_shape = _staging_dataset_output_shape(name, dataset, config)
   outputs = [np.empty((int(count),) + output_shape, dtype=dataset.dtype) for count in counts]
 
   for i0, i1 in zip(starts, ends):
     start = int(sorted_rows[i0])
     stop = int(sorted_rows[i1 - 1]) + 1
-    block = dataset[start:stop]
+    block = _read_staging_dataset_block(dataset, name, config, start, stop)
     local_rows = sorted_rows[i0:i1].astype(np.int64, copy=False) - start
     values = block[local_rows]
     ranks = sorted_rank[i0:i1]
@@ -299,10 +299,28 @@ def _write_ranked_hdf5_intervals(groups: list, name: str, dataset, rows_by_rank:
   return read_time, write_time, 'hdf5_intervals'
 
 
+def _project_staging_dataset(name: str, dataset, config: dict) -> bool:
+  return (
+      name == _metallicity_dataset_name(config)
+      and not _include_metallicities(config)
+      and getattr(dataset, 'ndim', 1) > 1
+  )
+
+
+def _staging_dataset_output_shape(name: str, dataset, config: dict):
+  if _project_staging_dataset(name, dataset, config):
+    return (1,)
+  return tuple(dataset.shape[1:])
+
+
+def _read_staging_dataset_block(dataset, name: str, config: dict, start: int, stop: int):
+  if _project_staging_dataset(name, dataset, config):
+    return dataset[start:stop, 0:1]
+  return dataset[start:stop]
+
+
 def _read_staging_source_dataset(dataset, name: str, config: dict):
-  if name == _metallicity_dataset_name(config) and not _include_metallicities(config) and getattr(dataset, 'ndim', 1) > 1:
-    return dataset[:, 0:1]
-  return dataset[:]
+  return _read_staging_dataset_block(dataset, name, config, 0, len(dataset))
 
 
 def _is_scalar_membership(membership) -> bool:
@@ -417,7 +435,7 @@ def _stage_ptype_scalar(
     if key in source_reads:
       raise RuntimeError(f'{ptype}/{name} would be read from the source snapshot more than once')
     source_reads.add(key)
-    if name in rank_ordered_names:
+    if name in rank_ordered_names or _project_staging_dataset(name, f[ptype][name], config):
       read_time, write_time, source = _write_ranked_hdf5_intervals(groups, name, f[ptype][name], rows_by_rank, config)
     else:
       t = perf_counter()
@@ -537,7 +555,7 @@ def _stage_ptype_dense(
     if key in source_reads:
       raise RuntimeError(f'{ptype}/{name} would be read from the source snapshot more than once')
     source_reads.add(key)
-    if name in rank_ordered_names:
+    if name in rank_ordered_names or _project_staging_dataset(name, f[ptype][name], config):
       read_time, write_time, source = _write_ranked_hdf5_intervals(groups, name, f[ptype][name], rows_by_rank, config)
     else:
       t = perf_counter()

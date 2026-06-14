@@ -18,7 +18,7 @@ from octavian.group_properties_calc.group_computations import (
     accumulate_membership_array_common_second,
     accumulate_membership_array_rotation,
     compute_angular_momentum,
-    compute_aperture_component_properties,
+    compute_aperture_component_properties_by_kind,
     compute_central_galaxy_flags,
     compute_galaxy_hydrogen_assignment,
     compute_gas_scalar_sums,
@@ -42,7 +42,6 @@ from octavian.group_properties_calc.group_helpers import (
     broadcast_to_particles,
     sort_by_group,
     weighted_mean_per_group,
-    extract_particle_arrays,
 )
 from octavian.utils.local_densities import calculate_local_density_arrays
 
@@ -1057,6 +1056,7 @@ def calculate_local_densities(data_manager: DataManager) -> None:
       group_data[['x_total', 'y_total', 'z_total']].to_numpy(),
       group_data['mass_total'].to_numpy(),
       data_manager.simulation['boxsize'],
+      workers=int(config.get('nproc', 1)),
     )
     for column, values in densities.items():
       group_data[column] = values
@@ -1133,38 +1133,96 @@ def assign_galaxy_hydrogen_masses(data_manager: DataManager) -> None:
   group_data['mass_H2'] = galaxy_H2
 
 def calculate_aperture_masses(data_manager, config):
-    """Compute 30 kpc aperture masses and velocity dispersions around galaxies.
-
-    Particles and galaxies are grouped by parent halo so each KDTree only covers a
-    halo-local particle set. The include matrix maps raw particle components onto
-    outputs such as gas, HI, H2, dust, total, and baryon."""
+    """Compute 30 kpc aperture masses without duplicating gas-derived components."""
 
     group_data = data_manager.group_data['galaxies']
     n_galaxies = len(group_data)
+    if n_galaxies == 0:
+        return
+
     galaxy_pos = group_data[['x_total', 'y_total', 'z_total']].to_numpy()
     parent_halo = group_data['parent_halo_index'].to_numpy()
     aperture = 30. # as defined previously
 
-    # use helper function
-    include_hydrogen = 'gas' in config['ptypes'] and {'mass_HI', 'mass_H2'}.issubset(data_manager.data['gas'].columns)
-    include_dust = 'gas' in config['ptypes'] and 'dustmass' in data_manager.data['gas'].columns
-    all_pos, all_mass, all_codes, all_halos, ptype_names, all_vel = extract_particle_arrays(
-        data_manager, config, include_hydrogen=include_hydrogen, include_dust=include_dust, include_velocities=True
-    )
-    # may want to check the helper function include_hydrogen part, thought it might be useful in future
-    n_ptypes = len(ptype_names)
-    # include_matrix[out, code] records which particle components contribute to each
-    # output component, including derived total and baryon apertures.
-    output_names = ptype_names + ['total', 'baryon']
+    physical_ptypes = list(config['ptypes'])
+    ptype_to_int = {ptype: i for i, ptype in enumerate(physical_ptypes)}
+    gas_code = ptype_to_int.get('gas', -1)
+    include_hydrogen = 'gas' in physical_ptypes and {'mass_HI', 'mass_H2'}.issubset(data_manager.data['gas'].columns)
+    include_dust = 'gas' in physical_ptypes and 'dustmass' in data_manager.data['gas'].columns
+
+    pos_list = []
+    mass_list = []
+    code_list = []
+    halo_list = []
+    vel_list = []
+    hi_list = []
+    h2_list = []
+    dust_list = []
+
+    for ptype in physical_ptypes:
+        df = data_manager.data[ptype]
+        n_particles = len(df)
+        pos_list.append(df[['x', 'y', 'z']].to_numpy())
+        masses = df['mass'].to_numpy()
+        mass_list.append(masses)
+        code_list.append(np.full(n_particles, ptype_to_int[ptype], dtype=np.int64))
+        halo_list.append(df['HaloID'].to_numpy(dtype=np.int64))
+        vel_list.append(df[['vx', 'vy', 'vz']].to_numpy())
+
+        if include_hydrogen:
+            if ptype == 'gas':
+                hi_list.append(df['mass_HI'].to_numpy())
+                h2_list.append(df['mass_H2'].to_numpy())
+            else:
+                hi_list.append(np.zeros(n_particles, dtype=masses.dtype))
+                h2_list.append(np.zeros(n_particles, dtype=masses.dtype))
+
+        if include_dust:
+            if ptype == 'gas':
+                dust_mass = df['dustmass'].to_numpy().copy()
+                if 'rho' in df:
+                    dust_mass[df['rho'].to_numpy() < config['nHlim']] = 0.
+                dust_list.append(dust_mass)
+            else:
+                dust_list.append(np.zeros(n_particles, dtype=masses.dtype))
+
+    if not pos_list:
+        return
+
+    all_pos = np.concatenate(pos_list)
+    all_mass = np.concatenate(mass_list)
+    all_codes = np.concatenate(code_list)
+    all_halos = np.concatenate(halo_list)
+    all_vel = np.concatenate(vel_list)
+    all_hi = np.concatenate(hi_list) if include_hydrogen else np.empty(0, dtype=all_mass.dtype)
+    all_h2 = np.concatenate(h2_list) if include_hydrogen else np.empty(0, dtype=all_mass.dtype)
+    all_dust = np.concatenate(dust_list) if include_dust else np.empty(0, dtype=all_mass.dtype)
+
+    output_names = list(physical_ptypes)
+    output_kinds = [0] * len(output_names)
+    output_codes = [ptype_to_int[ptype] for ptype in output_names]
+
+    if include_hydrogen:
+        output_names.extend(['HI', 'H2'])
+        output_kinds.extend([3, 4])
+        output_codes.extend([gas_code, gas_code])
+    if include_dust:
+        output_names.append('dust')
+        output_kinds.append(5)
+        output_codes.append(gas_code)
+
+    output_names.extend(['total', 'baryon'])
+    output_kinds.extend([1, 2])
+    output_codes.extend([-1, -1])
     output_index = {name: i for i, name in enumerate(output_names)}
-    include_matrix = np.zeros((len(output_names), n_ptypes), dtype=np.bool_)
-    for i in range(n_ptypes):
-        include_matrix[i, i] = True
-    for i, name in enumerate(ptype_names):
-        if name in config['ptypes']:
-            include_matrix[output_index['total'], i] = True
-        if name in config['ptypes_baryon']:
-            include_matrix[output_index['baryon'], i] = True
+
+    total_codes = np.zeros(len(physical_ptypes), dtype=np.bool_)
+    baryon_codes = np.zeros(len(physical_ptypes), dtype=np.bool_)
+    for ptype in physical_ptypes:
+        total_codes[ptype_to_int[ptype]] = True
+    for ptype in config['ptypes_baryon']:
+        if ptype in ptype_to_int:
+            baryon_codes[ptype_to_int[ptype]] = True
 
     # pre-sort particles by halo
     order, unique_halos, h_start, h_end = sort_by_group(all_halos)
@@ -1172,6 +1230,11 @@ def calculate_aperture_masses(data_manager, config):
     all_mass = all_mass[order]
     all_codes = all_codes[order]
     all_vel = all_vel[order]
+    if include_hydrogen:
+        all_hi = all_hi[order]
+        all_h2 = all_h2[order]
+    if include_dust:
+        all_dust = all_dust[order]
 
     # pre-sort galaxies by parent halo
     gal_order, halos_with_galaxies, gal_start, gal_end = sort_by_group(parent_halo)
@@ -1179,52 +1242,57 @@ def calculate_aperture_masses(data_manager, config):
     result = np.zeros((n_galaxies, len(output_names)))
     velocity_result = np.zeros((n_galaxies, len(output_names)))
     boxsize = data_manager.simulation['boxsize']
+    workers = int(config.get('nproc', 1))
+    output_kinds = np.asarray(output_kinds, dtype=np.int64)
+    output_codes = np.asarray(output_codes, dtype=np.int64)
 
     # Work halo-by-halo so neighbor searches stay small and respect host boundaries.
     for h in range(len(unique_halos)):
         halo_id = unique_halos[h]
         halo_pos = all_pos[h_start[h]:h_end[h]]
-        halo_mass = all_mass[h_start[h]:h_end[h]]
-        halo_codes = all_codes[h_start[h]:h_end[h]]
-        halo_vel = all_vel[h_start[h]:h_end[h]]
 
-        # guard
         if len(halo_pos) == 0:
             continue
 
-        gh_idx = np.searchsorted(halos_with_galaxies, halo_id) # find where the hid sits in halos_with_galaxies
+        gh_idx = np.searchsorted(halos_with_galaxies, halo_id)
         if gh_idx >= len(halos_with_galaxies) or halos_with_galaxies[gh_idx] != halo_id:
-            continue # skip halos with no galaxies
+            continue
         gal_indices = gal_order[gal_start[gh_idx]:gal_end[gh_idx]]
 
-        # guard
         if len(gal_indices) == 0:
             continue
 
-        # build KDTree (explained in FOF6D code)
-        # Wrap into the periodic box before using a periodic KDTree, so galaxies near
-        # boundaries can see particles across the box edge.
         halo_pos_wrapped = np.mod(halo_pos, boxsize)
         galaxy_pos_wrapped = np.mod(galaxy_pos[gal_indices], boxsize)
         tree = KDTree(halo_pos_wrapped, boxsize=boxsize)
         try:
-            neighbor_lists = tree.query_ball_point(galaxy_pos_wrapped, aperture, workers=-1)
+            neighbor_lists = tree.query_ball_point(galaxy_pos_wrapped, aperture, workers=workers)
         except TypeError:
             neighbor_lists = tree.query_ball_point(galaxy_pos_wrapped, aperture)
 
         neighbor_offsets, neighbor_indices = _flatten_neighbor_lists(neighbor_lists)
-        masses_local, sigmas_local = compute_aperture_component_properties(
+        local_slice = slice(h_start[h], h_end[h])
+        masses_local, sigmas_local = compute_aperture_component_properties_by_kind(
             neighbor_offsets,
             neighbor_indices,
-            halo_mass,
-            halo_codes.astype(np.int64),
-            halo_vel,
-            include_matrix,
+            all_mass[local_slice],
+            all_codes[local_slice],
+            all_vel[local_slice],
+            all_hi[local_slice] if include_hydrogen else all_hi,
+            all_h2[local_slice] if include_hydrogen else all_h2,
+            all_dust[local_slice] if include_dust else all_dust,
+            output_kinds,
+            output_codes,
+            total_codes,
+            baryon_codes,
+            gas_code,
         )
         result[gal_indices, :] = masses_local
         velocity_result[gal_indices, :] = sigmas_local
 
-    for i, name in enumerate(ptype_names):
+    for i, name in enumerate(output_names):
+        if name in ('total', 'baryon'):
+            continue
         group_data[f'mass_{name}_30kpc'] = result[:, i]
         group_data[f'velocity_dispersion_{name}_30kpc'] = velocity_result[:, i]
 

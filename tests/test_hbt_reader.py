@@ -400,7 +400,7 @@ def test_filter_snapshot_writes_dense_ranked_properties(tmp_path):
         assert f['PartType1']['particle_index'][:].tolist() == [1, 4]
 
 
-@pytest.mark.parametrize('include_metallicities', [False, True])
+@pytest.mark.parametrize('include_metallicities', [None, False, True])
 def test_filter_snapshot_metallicity_columns_follow_include_option(tmp_path, include_metallicities):
     snapshot = tmp_path / 'snap.hdf5'
     hbt_dir = tmp_path / '050'
@@ -432,14 +432,15 @@ def test_filter_snapshot_metallicity_columns_follow_include_option(tmp_path, inc
         'hbt_subhalo_path': str(hbt_dir),
         'MINIMUM_DM_PER_HALO': 1,
     }
-    if include_metallicities:
-        config_values['include_metallicities'] = True
+    if include_metallicities is not None:
+        config_values['include_metallicities'] = include_metallicities
     config.write_text(safe_dump(config_values))
 
     filter_snapshot(str(snapshot), str(outfile), str(config), nsplit=2)
 
-    expected_rank0 = metallicity[[0, 2, 5]] if include_metallicities else metallicity[[0, 2, 5], 0:1]
-    expected_rank1 = metallicity[[1, 4]] if include_metallicities else metallicity[[1, 4], 0:1]
+    full_metallicity = include_metallicities is not False
+    expected_rank0 = metallicity[[0, 2, 5]] if full_metallicity else metallicity[[0, 2, 5], 0:1]
+    expected_rank1 = metallicity[[1, 4]] if full_metallicity else metallicity[[1, 4], 0:1]
 
     with h5py.File(f'{outfile}_0.hdf5', 'r') as f:
         data = f['PartType0']['Metallicity'][:]

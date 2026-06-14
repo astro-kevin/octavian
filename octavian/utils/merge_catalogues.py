@@ -107,6 +107,7 @@ def _write_global_local_densities(out_group, config, group_name: str, simulation
     out_group[pos_dataset][:],
     out_group[mass_dataset][:],
     _simulation_boxsize(simulation),
+    workers=int(config.get('nproc', 1)),
   )
   for column, dataset in outputs.items():
     _replace_dataset(out_group, dataset, densities[column])

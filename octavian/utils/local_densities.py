@@ -7,7 +7,7 @@ from scipy.spatial import KDTree
 LOCAL_DENSITY_RADII = (300.0, 1000.0, 3000.0)
 
 
-def calculate_local_density_arrays(positions, masses, boxsize, radii=LOCAL_DENSITY_RADII):
+def calculate_local_density_arrays(positions, masses, boxsize, radii=LOCAL_DENSITY_RADII, workers=1):
   positions = np.asarray(positions)
   masses = np.asarray(masses)
   boxsize = float(np.asarray(boxsize).reshape(-1)[0])
@@ -27,7 +27,10 @@ def calculate_local_density_arrays(positions, masses, boxsize, radii=LOCAL_DENSI
   for radius in radii:
     radius_int = int(radius)
     volume = 4. / 3. * np.pi * radius**3
-    index_lists = tree.query_ball_point(positions, radius, workers=-1)
+    try:
+      index_lists = tree.query_ball_point(positions, radius, workers=workers)
+    except TypeError:
+      index_lists = tree.query_ball_point(positions, radius)
     results[f'local_mass_density_{radius_int}'] = np.asarray(
       [masses[indices].sum() for indices in index_lists],
       dtype=float,
